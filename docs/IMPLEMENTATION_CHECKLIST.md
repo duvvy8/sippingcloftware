@@ -11,7 +11,7 @@ No release or goal completion until all mandatory implementation is finished.
 | B01 | Review existing repository and experimental starter | Tested: repository empty, no commits or remote refs; adjacent frame contains one incomplete header and inconsistent build scripts; do not reuse architecture. |
 | B02 | C++20, CMake, MSVC, native x64; no global AVX2 requirement | Tested: CMake Release x64 builds with MSVC 19.51, C++20; no /arch:AVX2 flag. |
 | B03 | Qt 6 Widgets; FFmpeg libraries; Windows APIs; no Python runtime | Implemented / partially tested: Qt 6.10.0 Widgets, FFmpeg 63 libraries, native Windows APIs; dependency-staged native executable runs. Full app workflows pending. |
-| B04 | Pinned dependencies, reproducible bootstrap/build, source and licence notices | Implemented / untested bootstrap: dependencies.lock.json and scripts/bootstrap.ps1; font hashes verified; FFmpeg archive SHA256 matches. Complete source/licence distribution pending. |
+| B04 | Pinned dependencies, reproducible bootstrap/build, source and licence notices | Partially tested: pinned lock/bootstrap and default local .deps build; bootstrap -CacheRoot successfully copied Qt/FFmpeg and verified font hashes. Canonical FFmpeg download is now a dated archive with a pinned hash; clean network bootstrap/source notices remain pending. |
 | B05 | Bundle Inter and Geist Mono; no name, brand or logo | Implemented / partially tested: both font files and OFL notices bundled, startup registers fonts; UI consistency pending. |
 | B06 | Release dependency staging; per-user installer and uninstall | Pending |
 | B07 | Windows 10 22H2 and Windows 11 support | Pending; host Windows 10 19045, AMD iGPU + NVIDIA RTX 5070 Ti |
@@ -38,7 +38,7 @@ No release or goal completion until all mandatory implementation is finished.
 | C04 | Configurable storage/limits; duration and bytes whichever first, actual duration | Tested ring duration/byte limits and actual interval duration in core tests. Settings expose storage path, duration and byte limits. |
 | C05 | Bounded queues; dropped frames/backlog and actionable performance guidance | Implemented / untested: bounded 16-frame capture queue, backlog/drop stats, stop when lag exceeds 2s; UI guidance pending. |
 | C06 | Fixed toolbar endpoint; interval pinning; release/transfer pin ownership | Tested fixed and delayed endpoints, pin eviction protection, multiple pins and partial intervals; Qt toolbar Escape releases its pin. Queued toolbar interval integration still needs a full recording exercise. |
-| C07 | Partial buffer disclosure; delayed packet coverage; immutable multiple queued saves | Partial: isolated smoke waits through a 700ms toolbar delay and exports exactly the selected three seconds. Serial persisted queue implemented; multiple queued real exports still need integration coverage. |
+| C07 | Partial buffer disclosure; delayed packet coverage; immutable multiple queued saves | Partially tested: real fixed endpoint with 700ms delay; media integration test queues two distinct saves and verifies requested 2s/3s durations, retained tracks, full decoding and immutable 30fps settings after caller mutation. Hardware delayed-packet stress remains open. |
 | C08 | Safe disk exhaustion/failure, preserve clips, crash recovery | Pending |
 | C09 | Overlay exclusion, display changes, sleep/resume, device loss | Pending |
 | C10 | No silent recording changes; restart/buffer reset requires approval | Pending |
@@ -70,18 +70,18 @@ No release or goal completion until all mandatory implementation is finished.
 | L01 | Thumbnail/app/date/duration/dimensions/fps/codec/container/size metadata | Partially tested: indexed metadata displayed, generated media imported, on-demand thumbnail produced, Clips snapshots checked. |
 | L02 | Original/compressed/edited relation; audio-track count and HDR status | Implemented / partially tested: metadata includes relationship, track count and HDR; relation flows for edits/compression pending. |
 | L03 | Application filter/search; lazy cached thumbnails, no continuous scanning | Implemented / partially tested: app filtering/search, cached lazy thumbnails and explicit/event-based scans; idle resource measurement pending. |
-| L04 | Play/show folder/copy/rename/trim/crop/audio/compress actions | Partial: Play/Folder/Copy/Rename implemented; Qt tests exercise play and actual CF_HDROP data. Trim/crop/audio/compress follow later sequence steps. |
+| L04 | Play/show folder/copy/rename/trim/crop/audio/compress actions | Partial: Play/Folder/Copy/Rename/Trim/Crop/Audio connected; native UI exports a real edited clip and releases playback resources. Auto Compress remains in step 7. |
 | L05 | Rebuildable local index/sidecars; recover external rename/delete | Tested: external rename preserves Windows file identity and rebuilt index finds renamed media; deletion recovery untested. |
 
 ## 5. Playback and nondestructive editing
 | ID | Requirement | Status / evidence |
 |---|---|---|
 | E01 | On-demand playback/preview; release decoders on close | Tested Qt playback opens generated clip and releases the media player/decoder on dialog close at all three scale factors. |
-| E02 | New outputs, original untouched, resulting duration shown | Pending |
-| E03 | Packet-copy fast trim with keyframe rounding disclosure | Pending |
-| E04 | Exact trim re-encodes selected boundaries | Pending |
-| E05 | Free visible crop, 16:9/9:16/1:1; default fit entire image | Pending |
-| E06 | Audio track selection/gain/mute/mixed sharing track | Pending |
+| E02 | New outputs, original untouched, resulting duration shown | Tested: edit output is distinct; SHA256 of original remains unchanged after exact/fast/crop/audio/mix/cancel workflows. Editor shows resulting duration before submission. |
+| E03 | Packet-copy fast trim with keyframe rounding disclosure | Tested: packet-level remux rounds 2.3–6.7s to disclosed 2–8s keyframes on B-frame source; all tracks retained and output fully decoded. Failed FFmpeg timestamp-shift implementation was replaced, not tolerated. |
+| E04 | Exact trim re-encodes selected boundaries | Tested: exact 2.3–6.7s export meets frame/audio rounding tolerance; selected track gain ratio is within tolerance of 0.5. |
+| E05 | Free visible crop, 16:9/9:16/1:1; default fit entire image | Partially tested: free crop and visible numeric selection; 9:16 fit creates 100x180 output with black bars and complete source retained. 16:9/1:1 share the same tested helper; additional visual content validation remains pending. |
+| E06 | Audio track selection/gain/mute/mixed sharing track | Tested: selected-track export, gain changes, mute and one mixed sharing track; actual silent mixed output verified. Editor preview decoder is destroyed on close at all scale factors. |
 
 ## 6. HDR
 | ID | Requirement | Status / evidence |
@@ -95,7 +95,7 @@ No release or goal completion until all mandatory implementation is finished.
 | ID | Requirement | Status / evidence |
 |---|---|---|
 | J01 | Persist immutable jobs and exact specified state transitions | Partial: serial immutable save jobs persisted with crash recovery; compression state machine later in sequence. |
-| J02 | Serial export queue below capture priority; progress/settings/cancel | Partial: one below-normal-priority export worker and FFmpeg child; save cancellation implemented, detailed progress/compression cancellation pending. |
+| J02 | Serial export queue below capture priority; progress/settings/cancel | Partially tested: one below-normal export worker and child processes; editable progress and cancellation implemented. Multiple save jobs and edit cancellation cleanup pass. Compression path pending. |
 | J03 | Persist preferences/audio/shortcuts/folders/cache/relations/actions | Partial: settings/audio/shortcuts/folders/cache/save jobs and sidecar relationships persisted; outstanding notification actions later. |
 | J04 | Crash/restart marks interrupted jobs; retains originals, no false success | Tested persistence recovery: interrupted job becomes Failed and original bytes remain untouched. Process-crash integration pending. |
 | Q01 | Save/finalize/validate original first; retain unless explicitly recycled | Pending |
@@ -131,7 +131,7 @@ No release or goal completion until all mandatory implementation is finished.
 | T01 | Capture/buffer test matrix in specification | Partial: core replay endpoint, partial, delayed completion, pinning, duration/byte tests pass; remaining capture matrix open. |
 | T02 | Compatibility test matrix, distinguish verified/untested hardware | Pending |
 | T03 | Audio test matrix including long drift and removal | Pending |
-| T04 | Editing/compression test matrix incl byte boundaries and guard rejection | Pending |
+| T04 | Editing/compression test matrix incl byte boundaries and guard rejection | Partial: 8 media tests pass covering fast/exact trim, crop/fit, gain/mute/mix, cancellation, immutable queued saves and unchanged SHA256 originals. HDR and compression cases remain pending. |
 | T05 | Windows integration test matrix incl restart/stale/recycle failure | Partial: shortcut conflict preservation and CF_HDROP clipboard format pass; remaining integration matrix open. |
 | T06 | Measure idle CPU/RAM and no recording/decoding/continuous thumbs | Pending |
 | T07 | Measure capture CPU/GPU/encoder, disk/buffer, dropped/backlog, export speed | Pending |
@@ -145,4 +145,7 @@ No release or goal completion until all mandatory implementation is finished.
 
 
 - 2026-11-03: Release and four CTest targets pass (core plus native UI at 100/150/200%). Real WGC/NVENC 3s save, two-track non-silent system audio, fixed endpoint and changing frame content verified. Full-screen desktop test helper cannot obtain screenshot/input geometry; own Qt renders and integration tests used, limitation retained.
+
+
+- 2026-11-03: Editing milestone verified: core 13 checks, media 8 checks, native UI 8 checks at each scale. Original hashes retained; fast trim fixed with native packet remux after timestamp-shift failure. Bootstrap local cache path also verified.
 

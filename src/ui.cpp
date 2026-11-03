@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "editor.h"
 #include <QStandardItemModel>
 #include <cmath>
 namespace clip {
@@ -156,10 +157,16 @@ MainWindow::MainWindow() : exports_(&recorder_.buffer(), this), library_(this), 
             if (clips_->item(i, 0)->data(Qt::UserRole).toString() == path)
                 clips_->item(i, 0)->setIcon(QPixmap::fromImage(image));
     });
-    connect(&exports_, &ExportQueue::jobChanged, this, [this](const QString &) {
+    connect(&exports_, &ExportQueue::jobChanged, this, [this](const QString &id) {
         updateJobs();
-        if (!recorder_.active())
-            refreshLibrary();
+        for (const auto &job : exports_.jobs())
+            if (job.id == id && job.terminal && job.state == "Complete" && !completedSeen_.contains(id)) {
+                completedSeen_.insert(id);
+                if (recorder_.active())
+                    libraryRefreshPending_ = true;
+                else
+                    refreshLibrary();
+            }
     });
     connect(&timer_, &QTimer::timeout, this, &MainWindow::updateStatus);
     timer_.start(500);
@@ -253,6 +260,11 @@ QWidget *MainWindow::clipsPage() {
         }
     });
     r->addLayout(more);
+    auto *editing = new QHBoxLayout;
+    button("Trim", editing, [this] { showEditor(0); });
+    button("Crop / Aspect Ratio", editing, [this] { showEditor(1); });
+    button("Audio", editing, [this] { showEditor(2); });
+    r->addLayout(editing);
     r->addStretch();
     split->addWidget(right);
     split->setSizes({760, 320});
@@ -952,6 +964,10 @@ void MainWindow::updateJobs() {
 }
 void MainWindow::updateStatus() {
     auto s = recorder_.stats();
+    if (!s.active && libraryRefreshPending_) {
+        libraryRefreshPending_ = false;
+        refreshLibrary();
+    }
     recordStats_->setText(
         QString("%1 · %2\n%3 × %4 · %5 fps · %6\nBuffer: %7 / %8 · dropped %9 · backlog %10 frames\nAudio "
                 "discontinuities: %11%12")
@@ -1025,6 +1041,30 @@ void MainWindow::openClip(const QString &path) {
     tabs_->setCurrentIndex(0);
     selectedPath_ = path;
     refreshLibrary();
+}
+void MainWindow::showEditor(int tab) {
+    if (selectedPath_.isEmpty())
+        return;
+    try {
+        auto info = inspect(selectedPath_);
+        auto encoder = registry_.forCodec(info.codecId);
+        if (encoder.isEmpty())
+            throw std::runtime_error(
+                "Run encoder tests to select a verified implementation of this clip's codec");
+        auto *dialog = new EditorDialog(selectedPath_, encoder, tab, this);
+        const auto original = selectedPath_;
+        connect(dialog, &EditorDialog::exportRequested, this,
+                [this, original, encoder](const EditRequest &request) {
+                    try {
+                        exports_.submitEdit(original, request, encoder, "High");
+                    } catch (const std::exception &e) {
+                        showError(QString::fromUtf8(e.what()));
+                    }
+                });
+        dialog->show();
+    } catch (const std::exception &e) {
+        showError(QString::fromUtf8(e.what()));
+    }
 }
 void MainWindow::closeEvent(QCloseEvent *event) {
     if (exiting_)

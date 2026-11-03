@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "editor.h"
 #include <QtTest>
 #include <shellapi.h>
 namespace clip {
@@ -95,14 +96,71 @@ class UiTests : public QObject {
         dialog->close();
         QTRY_VERIFY(tracked.isNull());
     }
+    void editorExportAndDecoderCleanup() {
+        auto test = Registry::testEncoder("libx264");
+        QVERIFY(test["encoded"].toBool());
+        for (auto &cap : window_->registry_.encoders)
+            if (cap.name == "libx264") {
+                cap.encoded = true;
+                cap.initialized = true;
+                cap.tested.append(test);
+            }
+        window_->showEditor(1);
+        auto editors = window_->findChildren<EditorDialog *>();
+        QCOMPARE(editors.size(), 1);
+        auto *editor = editors.first();
+        editor->start_->setValue(.333);
+        editor->end_->setValue(1.333);
+        editor->crop_->setChecked(true);
+        editor->x_->setValue(20);
+        editor->y_->setValue(10);
+        editor->w_->setValue(100);
+        editor->h_->setValue(100);
+        editor->aspect_->setCurrentText("9:16");
+        QVERIFY(editor->result_->text().contains("1.000 s"));
+        QVERIFY(editor->grab().save("test-output/editor-" + qEnvironmentVariable("QT_SCALE_FACTOR", "1") +
+                                    ".png"));
+        auto buttons = editor->findChildren<QPushButton *>();
+        QPushButton *preview = nullptr;
+        QPushButton *exportButton = nullptr;
+        for (auto *button : buttons) {
+            if (button->text() == "Preview / Stop")
+                preview = button;
+            if (button->text() == "Export New File")
+                exportButton = button;
+        }
+        QVERIFY(preview && exportButton);
+        QTest::mouseClick(preview, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(editor->player_ && editor->player_->duration() > 0, 10000);
+        QPointer<QMediaPlayer> player(editor->player_);
+        QPointer<EditorDialog> tracked(editor);
+        QTest::mouseClick(exportButton, Qt::LeftButton);
+        QTRY_VERIFY(tracked.isNull());
+        QVERIFY(player.isNull());
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !window_->exports_.jobs().isEmpty() && window_->exports_.jobs().last().terminal, 15000);
+        auto job = window_->exports_.jobs().last();
+        QCOMPARE(job.state, QString("Complete"));
+        auto edited = inspect(job.output);
+        QCOMPARE(edited.width, 100);
+        QCOMPARE(edited.height, 180);
+        QVERIFY(std::abs(edited.duration - 1.) < .06);
+        QVERIFY(QFileInfo::exists(sample_));
+    }
     void externalRenameRecovery() {
         auto original = fileIdentity(sample_);
         QString renamed = QFileInfo(sample_).dir().filePath("renamed.mp4");
         QVERIFY(QFile::rename(sample_, renamed));
         QCOMPARE(fileIdentity(renamed), original);
         window_->refreshLibrary();
-        QTRY_COMPARE_WITH_TIMEOUT(window_->library_.records().size(), 1, 10000);
-        QTRY_COMPARE_WITH_TIMEOUT(window_->library_.records().first().path, renamed, 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            [&] {
+                for (auto &r : window_->library_.records())
+                    if (r.path == renamed)
+                        return true;
+                return false;
+            }(),
+            10000);
     }
     void closeHidesWithoutExit() {
         window_->close();

@@ -1,5 +1,6 @@
 #pragma once
 #include "recorder.h"
+#include "edit.h"
 namespace clip {
 struct ExportJob {
     QString id, state = "Queued", message, application = "Desktop", executable, original, output,
@@ -32,6 +33,8 @@ class ExportQueue : public QObject {
     ~ExportQueue();
     QString submitSave(const Interval &, const Settings &, const QString &application,
                        const QString &executable);
+    QString submitEdit(const QString &original, const EditRequest &, const QString &encoder,
+                       const QString &quality);
     QList<ExportJob> jobs() const;
     void cancel(const QString &);
     void shutdown();

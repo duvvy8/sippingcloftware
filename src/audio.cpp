@@ -207,8 +207,14 @@ AudioEngine::~AudioEngine() {
     stop();
 }
 QList<AudioDevice> AudioEngine::devices() {
-    const HRESULT initialized=CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    struct Apartment { bool owned; ~Apartment(){if(owned)CoUninitialize();} } apartment{SUCCEEDED(initialized)};
+    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    struct Apartment {
+        bool owned;
+        ~Apartment() {
+            if (owned)
+                CoUninitialize();
+        }
+    } apartment{SUCCEEDED(initialized)};
     QList<AudioDevice> list;
     ComPtr<IMMDeviceEnumerator> en;
     if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en))))

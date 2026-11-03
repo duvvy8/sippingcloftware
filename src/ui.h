@@ -59,6 +59,8 @@ class MainWindow : public QMainWindow {
     bool exiting_ = false;
     QString selectedPath_;
     QTimer timer_;
+    QSet<QString> completedSeen_;
+    bool libraryRefreshPending_ = false;
     QWidget *clipsPage();
     QWidget *recordingPage();
     QWidget *settingsPage();
@@ -74,6 +76,7 @@ class MainWindow : public QMainWindow {
     void probeEncoders();
     void showError(const QString &);
     void showPlayer(const QString &);
+    void showEditor(int tab);
     void calibrate();
     void closeEvent(QCloseEvent *) override;
 

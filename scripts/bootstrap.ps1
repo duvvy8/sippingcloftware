@@ -24,6 +24,11 @@ if (-not (Test-Path "$deps\ffmpeg\$($lock.ffmpeg.folder)\include\libavcodec\avco
   Invoke-WebRequest -Uri $lock.ffmpeg.url -Headers @{Accept='application/octet-stream';'User-Agent'='native-clipper-build'} -OutFile $archive
   if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $lock.ffmpeg.sha256) { throw 'FFmpeg archive hash mismatch; refusing changed dependency.' }
   Expand-Archive -LiteralPath $archive -DestinationPath "$deps\ffmpeg" -Force
+  $expanded = [IO.Path]::GetFullPath("$deps\ffmpeg\$($lock.ffmpeg.archiveRoot)")
+  $expected = [IO.Path]::GetFullPath("$deps\ffmpeg\$($lock.ffmpeg.folder)")
+  $boundary = [IO.Path]::GetFullPath("$deps\ffmpeg") + '\'
+  if (-not $expanded.StartsWith($boundary,[StringComparison]::OrdinalIgnoreCase) -or -not $expected.StartsWith($boundary,[StringComparison]::OrdinalIgnoreCase)) { throw 'Dependency path escaped the intended cache directory.' }
+  if ($expanded -ne $expected) { Move-Item -LiteralPath $expanded -Destination $expected }
 }
 foreach ($f in @(@('InterVariable.ttf',$lock.inter.sha256),@('GeistMono-Regular.ttf',$lock.geistMono.sha256))) {
   if ((Get-FileHash -LiteralPath "$root\assets\fonts\$($f[0])" -Algorithm SHA256).Hash.ToLowerInvariant() -ne $f[1]) { throw "Font hash mismatch: $($f[0])" }

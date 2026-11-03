@@ -174,7 +174,7 @@ void configureEncoder(AVCodecContext *c, const QString &quality, qint64 bitrate,
     } else if (n.startsWith("prores")) {
         opt("profile", "3");
     } else if (n == "ffv1") {
-        opt("level", "3");
+        c->level = 3;
         opt("coder", "1");
         opt("context", "1");
     } else if (!bitrate) {

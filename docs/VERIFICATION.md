@@ -99,3 +99,10 @@ overlay placement/exclusion over a game remains unverified.
 Remaining capture/audio reliability, full toolbar-save integration, editing, HDR, compression and VMAF,
 clipboard, interactive persistent notifications, resource/game performance,
 installer and installed-app verification are unfinished. The goal remains active.
+
+## Editing milestone
+
+All five CTest targets pass: core (13 checks), media (8 checks), and native UI (8 checks each at 100/150/200%). Media checks cover exact and keyframe-rounded fast trimming of a B-frame source, full decode, crop dimensions, portrait fitting with black bars, selected-track gain ratio, muted sharing mix, cancellation cleanup, unchanged SHA256 originals, and two serial immutable interval saves with retained audio. Native UI tests export an edited file and verify editor/player destruction at all three scales. The 200% editor render was visually inspected; export/cancel controls remain visible.
+
+Fast trim initially failed duration validation because command-line timestamp shifting retained extra footage. Packet-level remux now explicitly selects the disclosed GOP interval, rebases timestamps and validates the complete output. No duration tolerance was weakened.
+

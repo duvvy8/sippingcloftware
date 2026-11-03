@@ -1,4 +1,5 @@
 #include "jobs.h"
+#include "platform.h"
 namespace clip {
 QJsonObject ExportJob::json() const {
     QJsonArray segments;
@@ -111,6 +112,40 @@ QList<ExportJob> ExportQueue::jobs() const {
     std::lock_guard lock(mutex_);
     return jobs_;
 }
+QString ExportQueue::submitEdit(const QString &original, const EditRequest &request, const QString &encoder,
+                                const QString &quality) {
+    ExportJob job;
+    job.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    job.kind = "edit";
+    job.original = original;
+    job.created = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+    auto sidecar = readJson(original + ".clip.json");
+    job.application = sidecar["application"].toString(QFileInfo(original).dir().dirName());
+    job.executable = sidecar["executable"].toString();
+    job.settings.encoder = encoder;
+    job.settings.quality = quality;
+    job.details = {{"edit", request.json()}, {"sourceIdentity", fileIdentity(original)}};
+    if (job.details["sourceIdentity"].toObject().isEmpty())
+        throw std::runtime_error("Original is unavailable");
+    job.output = uniquePath(QFileInfo(original).absolutePath(),
+                            QFileInfo(original).completeBaseName() + "_edited_" + job.id.left(8),
+                            QFileInfo(original).suffix());
+    {
+        std::lock_guard lock(mutex_);
+        if (stopping_)
+            throw std::runtime_error("Export queue is stopping");
+        jobs_ << job;
+        try {
+            persistLocked();
+        } catch (...) {
+            jobs_.removeLast();
+            throw;
+        }
+        changed_.notify_all();
+    }
+    emit jobChanged(job.id);
+    return job.id;
+}
 void ExportQueue::update(const QString &id, const QString &state, const QString &message, bool terminal) {
     {
         std::lock_guard lock(mutex_);
@@ -162,7 +197,11 @@ void ExportQueue::shutdown() {
                 j.state = "Cancelled";
                 j.terminal = true;
                 j.message = "Application exited before this export started.";
-                buffer_->release(j.source.id);
+                try {
+                    buffer_->release(j.source.id);
+                } catch (const std::exception &e) {
+                    qWarning("Replay pin release at shutdown: %s", e.what());
+                }
             }
         try {
             persistLocked();
@@ -199,30 +238,67 @@ void ExportQueue::run() {
             cancel_ = false;
         }
         try {
-            update(job.id, "Saving original", "Waiting for final packets at the selected endpoint");
-            auto resolved = buffer_->resolve(job.source.id, &cancel_);
-            resolved.start = qMax(resolved.start, job.source.start);
-            resolved.end = qMin(resolved.end, job.source.end);
-            QList<Segment> chosen;
-            for (auto &s : resolved.segments)
-                if (s.end > resolved.start && s.start < resolved.end)
-                    chosen << s;
-            resolved.segments = chosen;
-            {
-                std::lock_guard lock(mutex_);
-                for (auto &j : jobs_)
-                    if (j.id == job.id)
-                        j.source = resolved;
-                persistLocked();
+            if (job.kind == "edit") {
+                if (fileIdentity(job.original) != job.details["sourceIdentity"].toObject())
+                    throw std::runtime_error("Original changed since this edit was queued");
+                update(job.id, "Encoding", "Creating a nondestructive edited copy");
+                QElapsedTimer throttle;
+                throttle.start();
+                auto info =
+                    editMedia(job.original, job.output, EditRequest::fromJson(job.details["edit"].toObject()),
+                              job.settings.encoder, job.settings.quality, &cancel_, [&](double progress) {
+                                  if (throttle.elapsed() < 250)
+                                      return;
+                                  throttle.restart();
+                                  {
+                                      std::lock_guard lock(mutex_);
+                                      for (auto &j : jobs_)
+                                          if (j.id == job.id)
+                                              j.progress = progress;
+                                  }
+                                  emit jobChanged(job.id);
+                              });
+                if (fileIdentity(job.original) != job.details["sourceIdentity"].toObject())
+                    throw std::runtime_error(
+                        "Original changed while the edit was processing; output retained for inspection");
+                if (!writeJson(job.output + ".clip.json", {{"id", job.id},
+                                                           {"application", job.application},
+                                                           {"executable", job.executable},
+                                                           {"created", job.created},
+                                                           {"relationship", "edited"},
+                                                           {"parent", job.original},
+                                                           {"media", info.json()}}))
+                    throw std::runtime_error("Edited file saved, but metadata could not be persisted");
+                update(job.id, "Complete", "Edited copy saved; original retained", true);
+            } else {
+                update(job.id, "Saving original", "Waiting for final packets at the selected endpoint");
+                auto resolved = buffer_->resolve(job.source.id, &cancel_);
+                resolved.start = qMax(resolved.start, job.source.start);
+                resolved.end = qMin(resolved.end, job.source.end);
+                QList<Segment> chosen;
+                for (auto &s : resolved.segments)
+                    if (s.end > resolved.start && s.start < resolved.end)
+                        chosen << s;
+                resolved.segments = chosen;
+                {
+                    std::lock_guard lock(mutex_);
+                    for (auto &j : jobs_)
+                        if (j.id == job.id)
+                            j.source = resolved;
+                    persistLocked();
+                }
+                saveInterval(resolved, job.settings, job.original, &cancel_);
+                auto info = inspect(job.original);
+                QJsonObject sidecar{{"id", job.id},
+                                    {"application", job.application},
+                                    {"executable", job.executable},
+                                    {"created", job.created},
+                                    {"relationship", "original"},
+                                    {"media", info.json()}};
+                if (!writeJson(job.original + ".clip.json", sidecar))
+                    throw std::runtime_error("Clip saved, but metadata could not be written");
+                update(job.id, "Complete", "Clip saved and completely decoded", true);
             }
-            saveInterval(resolved, job.settings, job.original, &cancel_);
-            auto info = inspect(job.original);
-            QJsonObject sidecar{
-                {"id", job.id},           {"application", job.application}, {"executable", job.executable},
-                {"created", job.created}, {"relationship", "original"},     {"media", info.json()}};
-            if (!writeJson(job.original + ".clip.json", sidecar))
-                throw std::runtime_error("Clip saved, but metadata could not be written");
-            update(job.id, "Complete", "Clip saved and completely decoded", true);
         } catch (const std::exception &e) {
             try {
                 update(job.id, cancel_ ? "Cancelled" : "Failed", QString::fromUtf8(e.what()), true);
