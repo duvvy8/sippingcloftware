@@ -1,0 +1,14 @@
+{
+  "qt": {"version":"6.10.0","arch":"win64_msvc2022_64","modules":["qtmultimedia"],"source":"https://download.qt.io/archive/qt/6.10/6.10.0/"},
+  "ffmpeg": {
+    "version":"N-128352-gec887b13a8-20261103",
+    "assetId":705661920,
+    "url":"https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/assets/705661920",
+    "sha256":"46eeb30d4ddddc1e8789246399836af1e32d883e3bf48a6a7cf5f6a4f4031540",
+    "folder":"ffmpeg-master-latest-win64-gpl-shared",
+    "source":"https://github.com/FFmpeg/FFmpeg/tree/ec887b13a8",
+    "buildSource":"https://github.com/BtbN/FFmpeg-Builds"
+  },
+  "inter":{"commit":"353b61b9f4430d5f420d56605a6e7993e0941470","sha256":"4989b125924991b90d05b2d16e0e388c48f7d5bb8b30539bbf9c755278d0ccaf"},
+  "geistMono":{"commit":"a2357c1398c81d88ff84823a2f50af3152ee8733","sha256":"5a0de4b3d54ab272f76a1d8c84b7fb24c67bbec6591d5300e61c7bc10094b6c8"}
+}

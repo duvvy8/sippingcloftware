@@ -1,0 +1,7 @@
+.deps/
+build/
+dist/
+.vs/
+*.user
+*.log
+test-output/
