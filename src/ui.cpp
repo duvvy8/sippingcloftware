@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "notifications.h"
 #include "editor.h"
 #include <QStandardItemModel>
 #include <cmath>
@@ -89,8 +90,12 @@ void applyAppearance(QApplication &app) {
  QCheckBox::indicator { width:18px; height:18px; }
  )");
 }
-MainWindow::MainWindow() : exports_(&recorder_.buffer(), this), library_(this), hotkeys_(this) {
+MainWindow::MainWindow(bool activationOnly)
+    : exports_(&recorder_.buffer(), this), library_(this), hotkeys_(this) {
     settings_.load();
+    for (const auto &job : exports_.jobs())
+        if (job.terminal)
+            notifiedStates_[job.id] = job.state;
     recorded_ = settings_;
     registry_.discover();
     auto cache = readJson(stateDir() + "/encoders.json");
@@ -168,6 +173,11 @@ MainWindow::MainWindow() : exports_(&recorder_.buffer(), this), library_(this), 
     connect(&exports_, &ExportQueue::jobChanged, this, [this](const QString &id) {
         updateJobs();
         for (const auto &job : exports_.jobs())
+            if (job.id == id && job.terminal && notifiedStates_.value(id) != job.state) {
+                notifiedStates_[id] = job.state;
+                emit notificationReady(id);
+            }
+        for (const auto &job : exports_.jobs())
             if (job.id == id && job.terminal &&
                 (job.state == "Complete" || job.state == "Already within limit" ||
                  job.state == "Compressed but clipboard copy failed") &&
@@ -189,7 +199,7 @@ MainWindow::MainWindow() : exports_(&recorder_.buffer(), this), library_(this), 
     updateCaptureChoices();
     refreshLibrary();
     updateJobs();
-    if (settings_.autoRecord)
+    if (settings_.autoRecord && !activationOnly)
         QTimer::singleShot(0, this, &MainWindow::toggleRecording);
 }
 MainWindow::~MainWindow() {
@@ -303,13 +313,15 @@ QWidget *MainWindow::clipsPage() {
     jobs_ = new QListWidget;
     jobs_->setMaximumHeight(130);
     jobs_->setFont(mono());
+    jobs_->setWordWrap(true);
     v->addWidget(jobs_);
-    button("Cancel selected job", v, [this] {
+    auto *decisions = new QHBoxLayout;
+    auto *cancelJob = button("Cancel job", decisions, [this] {
         auto *item = jobs_->currentItem();
         if (item)
             exports_.cancel(item->data(Qt::UserRole).toString());
     });
-    button("Retry Copy", v, [this] {
+    auto *retryCopy = button("Retry Copy", decisions, [this] {
         auto *item = jobs_->currentItem();
         if (!item)
             return;
@@ -321,6 +333,43 @@ QWidget *MainWindow::clipsPage() {
             showError(QString::fromUtf8(e.what()));
         }
     });
+    auto decide = [this](bool recycle) {
+        auto *item = jobs_->currentItem();
+        if (!item)
+            return;
+        try {
+            QString error;
+            if (!exports_.decideOriginal(item->data(Qt::UserRole).toString(), recycle, &error))
+                showError(error);
+            else if (!recorder_.active())
+                refreshLibrary();
+        } catch (const std::exception &e) {
+            showError(QString::fromUtf8(e.what()));
+        }
+    };
+    auto *yes = button("Yes: Recycle original", decisions, [decide] { decide(true); });
+    auto *no = button("No: Keep original", decisions, [decide] { decide(false); });
+    yes->setObjectName("recycleOriginal");
+    no->setObjectName("retainOriginal");
+    v->addLayout(decisions);
+    auto updateActions = [this, cancelJob, retryCopy, yes, no] {
+        ExportJob selected;
+        auto *item = jobs_->currentItem();
+        if (item)
+            for (const auto &job : exports_.jobs())
+                if (job.id == item->data(Qt::UserRole).toString())
+                    selected = job;
+        bool pending = selected.state == "Complete" && selected.details["copied"].toBool() &&
+                       !selected.details["alreadySmall"].toBool() &&
+                       QStringList{"Pending", "Recycle failed", "Recycle interrupted"}.contains(
+                           selected.details["deleteDecision"].toString());
+        cancelJob->setEnabled(!selected.id.isEmpty() && !selected.terminal);
+        retryCopy->setEnabled(selected.terminal && selected.details["copyPending"].toBool());
+        yes->setEnabled(pending);
+        no->setEnabled(pending);
+    };
+    connect(jobs_, &QListWidget::currentItemChanged, this, updateActions);
+    updateActions();
     connect(search_, &QLineEdit::textChanged, this, &MainWindow::fillLibrary);
     connect(applicationFilter_, &QComboBox::currentTextChanged, this, &MainWindow::fillLibrary);
     connect(clips_, &QTableWidget::itemSelectionChanged, this, &MainWindow::selectClip);
@@ -1187,6 +1236,42 @@ void MainWindow::openClip(const QString &path) {
     tabs_->setCurrentIndex(0);
     selectedPath_ = path;
     refreshLibrary();
+}
+void MainWindow::handleNotificationAction(const QString &arguments) {
+    auto action = parseNotificationAction(arguments);
+    if (!action.valid) {
+        status_->setText("Invalid notification action rejected");
+        return;
+    }
+    try {
+        ExportJob job;
+        for (const auto &candidate : exports_.jobs())
+            if (candidate.id == action.job)
+                job = candidate;
+        if (job.id.isEmpty())
+            throw std::runtime_error("This notification refers to an unavailable job");
+        QString error;
+        if (action.action == "retry") {
+            if (!exports_.retryCopy(job.id, &error))
+                throw std::runtime_error(error.toStdString());
+        } else if (action.action == "yes" || action.action == "no") {
+            if (!exports_.decideOriginal(job.id, action.action == "yes", &error))
+                throw std::runtime_error(error.toStdString());
+            if (!recorder_.active())
+                refreshLibrary();
+        } else {
+            QString path = !job.output.isEmpty() ? job.output : job.original;
+            auto identity = path == job.original ? job.details["originalIdentity"].toObject()
+                                                 : job.details["outputIdentity"].toObject();
+            if (identity.isEmpty() || fileIdentity(path) != identity)
+                throw std::runtime_error("The clip from this notification moved, changed or is unavailable");
+            openClip(path);
+        }
+    } catch (const std::exception &e) {
+        status_->setText(QString::fromUtf8(e.what()));
+        // Activation-only failures stay available in the app without opening the main window.
+        qWarning("Notification action: %s", e.what());
+    }
 }
 void MainWindow::showEditor(int tab, bool sdr) {
     if (selectedPath_.isEmpty())

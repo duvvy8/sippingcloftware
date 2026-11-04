@@ -18,6 +18,7 @@ class ExportQueue : public QObject {
     ReplayBuffer *buffer_;
     QString folder_;
     mutable std::mutex mutex_;
+    std::mutex actions_;
     std::condition_variable changed_;
     QList<ExportJob> jobs_;
     std::thread worker_;
@@ -39,6 +40,7 @@ class ExportQueue : public QObject {
     QList<ExportJob> jobs() const;
     void cancel(const QString &);
     bool retryCopy(const QString &, QString *error = nullptr);
+    bool decideOriginal(const QString &id, bool recycle, QString *error = nullptr);
     void shutdown();
   signals:
     void jobChanged(QString id);

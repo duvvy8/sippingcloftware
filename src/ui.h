@@ -60,6 +60,7 @@ class MainWindow : public QMainWindow {
     QString selectedPath_;
     QTimer timer_;
     QSet<QString> completedSeen_;
+    QMap<QString, QString> notifiedStates_;
     bool libraryRefreshPending_ = false;
     bool resetApproved_ = false;
     QWidget *clipsPage();
@@ -84,11 +85,20 @@ class MainWindow : public QMainWindow {
     void closeEvent(QCloseEvent *) override;
 
   public:
-    MainWindow();
+    explicit MainWindow(bool activationOnly = false);
     ~MainWindow();
     void toggleRecording();
     void exitApplication();
     void openClip(const QString &);
+    void handleNotificationAction(const QString &);
+    bool notificationsEnabled() const {
+        return settings_.notifications;
+    }
+    QList<ExportJob> exportJobs() const {
+        return exports_.jobs();
+    }
+  signals:
+    void notificationReady(QString jobId);
 };
 void applyAppearance(QApplication &);
 } // namespace clip

@@ -1,6 +1,9 @@
 #include "recorder.h"
 #include "registry.h"
 #include "ui.h"
+#include "notifications.h"
+#include "instance.h"
+#include <winrt/base.h>
 #include <QApplication>
 #include <QFontDatabase>
 #include <QMainWindow>
@@ -91,12 +94,63 @@ int main(int argc, char **argv) {
         return report.contains("error") ? 1 : 0;
     }
     try {
+        if (args.contains("--register-shell") || args.contains("--unregister-shell")) {
+            QString error;
+            bool ok = clip::Notifications::registerShell(args.contains("--register-shell"), &error);
+            if (!value("--result").isEmpty())
+                clip::writeJson(value("--result"), {{"ok", ok}, {"error", error}});
+            return ok ? 0 : 1;
+        }
         clip::applyAppearance(app);
         app.setQuitOnLastWindowClosed(false);
-        clip::MainWindow window;
-        if (!args.contains("--background"))
+        const bool activation = args.contains("--notification-server");
+        clip::Instance instance;
+        QString error;
+        bool primary = instance.acquire(&error);
+        if (args.contains("--exit"))
+            return primary ? 0 : instance.forward({{"command", "exit"}}, &error) ? 0 : 1;
+        if (!primary && !activation)
+            return instance.forward({{"command", "show"}}, &error) ? 0 : 1;
+        clip::Notifications notifications;
+        if (!primary) {
+            QObject::connect(&notifications, &clip::Notifications::activated, &app, [&](QString arguments) {
+                bool delivered =
+                    instance.forward({{"command", "notification"}, {"arguments", arguments}}, &error);
+                QCoreApplication::exit(delivered ? 0 : 1);
+            });
+            QTimer::singleShot(30000, &app, [] { QCoreApplication::exit(1); });
+            return app.exec();
+        }
+        clip::MainWindow window(activation);
+        QObject::connect(&notifications, &clip::Notifications::activated, &window,
+                         &clip::MainWindow::handleNotificationAction);
+        QObject::connect(&instance, &clip::Instance::received, &window, [&](QJsonObject message) {
+            if (message["command"].toString() == "notification")
+                window.handleNotificationAction(message["arguments"].toString());
+            else if (message["command"].toString() == "exit")
+                window.exitApplication();
+            else if (message["command"].toString() == "show") {
+                window.showNormal();
+                window.raise();
+                window.activateWindow();
+            }
+        });
+        QObject::connect(&window, &clip::MainWindow::notificationReady, &window, [&](QString id) {
+            if (!window.notificationsEnabled())
+                return;
+            for (const auto &job : window.exportJobs())
+                if (job.id == id) {
+                    QString reason;
+                    if (!notifications.show(job, &reason))
+                        qWarning("Native notification: %s", qPrintable(reason));
+                }
+        });
+        if (!args.contains("--background") && !activation)
             window.show();
         return app.exec();
+    } catch (const winrt::hresult_error &e) {
+        QMessageBox::critical(nullptr, "Startup failed", QString::fromWCharArray(e.message().c_str()));
+        return 1;
     } catch (const std::exception &e) {
         QMessageBox::critical(nullptr, "Startup failed", QString::fromUtf8(e.what()));
         return 1;

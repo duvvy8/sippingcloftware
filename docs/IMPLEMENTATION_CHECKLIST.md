@@ -94,9 +94,9 @@ No release or goal completion until all mandatory implementation is finished.
 ## 7. Compression, jobs, cancellation
 | ID | Requirement | Status / evidence |
 |---|---|---|
-| J01 | Persist immutable jobs and exact specified state transitions | Partial: serial immutable save jobs persisted with crash recovery; compression state machine later in sequence. |
+| J01 | Persist immutable jobs and exact specified state transitions | Partially tested: immutable save/edit/compression jobs and named analysis/encode/validate/copy/terminal states persisted. Queued save-and-compress, original retention, clipboard failure/retry and restart actions pass; forced process-crash matrix remains open. |
 | J02 | Serial export queue below capture priority; progress/settings/cancel | Partially tested: one below-normal export worker and child processes; editable progress and cancellation implemented. Multiple save jobs and edit cancellation cleanup pass. Compression path pending. |
-| J03 | Persist preferences/audio/shortcuts/folders/cache/relations/actions | Partial: settings/audio/shortcuts/folders/cache/save jobs and sidecar relationships persisted; outstanding notification actions later. |
+| J03 | Persist preferences/audio/shortcuts/folders/cache/relations/actions | Partially tested: settings/audio/shortcuts/folders/cache/relationships plus notification decisions, copy retry and recycle transaction paths persisted; restart decision tests pass. Wider installed upgrade/recovery tests remain open. |
 | J04 | Crash/restart marks interrupted jobs; retains originals, no false success | Tested persistence recovery: interrupted job becomes Failed and original bytes remain untouched. Process-crash integration pending. |
 | Q01 | Save/finalize/validate original first; retain unless explicitly recycled | Partially tested: queued save-and-compress validates 3s original before analysis/copy, immutable 30fps snapshot and original retained. Larger capture-to-compression exercise remains open. |
 | Q02 | <=20,000,000 bytes; 19.5MB internal target; no shortening or recording changes | Partially tested: actual finalized-byte validation, exact 20MB boundary and 20MB+1 padded source processed; unchanged original hash and duration checks pass. Representative gaming input remains open. |
@@ -116,14 +116,14 @@ No release or goal completion until all mandatory implementation is finished.
 ## 8. Clipboard and persistent interactive notifications
 | ID | Requirement | Status / evidence |
 |---|---|---|
-| I01 | Real CF_HDROP file clipboard, contention retries, file stays on disk | Partially tested: CF_HDROP and Preferred DropEffect are written; native Qt integration reads actual file data from clipboard. Contention and destination paste tests pending. |
-| I02 | Clipboard failure retains files, accurate message, Retry Copy, no success toast | Implemented / untested failure branch: persisted copyPending/output identity, Retry Copy button, accurate terminal state; actual contention/failure tests remain open. |
-| I03 | Exact size/quality failure message, limiting reason in app; accurate other errors | Pending |
-| I04 | Successful copy exact deletion question with Yes/No; already-small no deletion | Pending |
-| I05 | Persisted job IDs resolve actions; body opens corresponding clip | Pending |
-| I06 | Yes recycles corresponding identity-verified original only, never permanently deletes | Pending |
-| I07 | No/dismiss/ignore retains; repeated/stale actions harmless; compressed intact | Pending |
-| I08 | Restart activation works without needless main window, in-app suppressed fallback | Pending |
+| I01 | Real CF_HDROP file clipboard, contention retries, file stays on disk | Partially tested: real CF_HDROP/Preferred DropEffect, native readback, separate-process short contention retry. Representative destination paste remains open. |
+| I02 | Clipboard failure retains files, accurate message, Retry Copy, no success toast | Tested: another process locks clipboard through actual compression; both files retained, correct failure state/message and Retry Copy XML, no deletion/success prompt. Retry succeeds after release and produces the success question. |
+| I03 | Exact size/quality failure message, limiting reason in app; accurate other errors | Partially tested: exact failure XML/text and specific original-preserving audio/lossless/cancel/copy states pass. Native toast presentation unverified because Windows global notifications are disabled. |
+| I04 | Successful copy exact deletion question with Yes/No; already-small no deletion | Partially tested: exact native toast XML/actions and queued already-small exclusion pass. Actual native delivery/clicks remain unverified under disabled system notifications. |
+| I05 | Persisted job IDs resolve actions; body opens corresponding clip | Partially tested: strict UUID/action parser rejects paths and duplicate/unknown fields; COM activation resolves persisted job. Identity-checked body-open handler implemented; body click presentation untested. |
+| I06 | Yes recycles corresponding identity-verified original only, never permanently deletes | Tested on disposable files: identity-locked staging, explicit Shell ITransferSource::RecycleItem (no RemoveItem/DeleteFile fallback), corresponding original recycled, compressed identity unchanged. Persisted/repeated Yes passes. |
+| I07 | No/dismiss/ignore retains; repeated/stale actions harmless; compressed intact | Partially tested: No survives restart and wins over later Yes; replaced originals rejected; interrupted staged original restored on No; locked-original failure retains both. Dismiss/ignore perform no operation by construction; actual dismissal UI untested. |
+| I08 | Restart activation works without needless main window, in-app suppressed fallback | Partially tested: real per-user COM registration starts clipper.exe on activation, resolves persisted No, retains both and exposes no visible window. At all three scales an actual compression job exposes in-app decisions; clicking No retains both and disables further decisions. Native popup/history test explicitly skipped: system ToastEnabled=0; preference unchanged. |
 
 ## 9. Reliability, performance and delivery gates
 | ID | Requirement | Status / evidence |

@@ -86,7 +86,7 @@ class CoreTests : public QObject {
         std::thread producer([&] {
             std::this_thread::sleep_for(std::chrono::milliseconds(30));
             QFile f(d.filePath("a"));
-            f.open(QIODevice::WriteOnly);
+            QVERIFY(f.open(QIODevice::WriteOnly));
             f.write("x");
             f.close();
             b.add({f.fileName(), 0, 3, 1});

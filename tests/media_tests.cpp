@@ -159,8 +159,8 @@ class MediaTests : public QObject {
         r.gains = {1, 1};
         std::atomic_bool cancel = true;
         auto out = directory_.filePath("cancelled.mp4");
-        QVERIFY_EXCEPTION_THROWN(clip::editMedia(original_, out, r, "libx264", "High", &cancel),
-                                 std::runtime_error);
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error,
+                                 clip::editMedia(original_, out, r, "libx264", "High", &cancel));
         QVERIFY(!QFileInfo::exists(out));
         QVERIFY(!QFileInfo::exists(out + ".partial"));
         QCOMPARE(digest(original_), digest_);

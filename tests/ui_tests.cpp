@@ -164,6 +164,33 @@ class UiTests : public QObject {
         QCOMPARE(job.output, sample_);
         QVERIFY(job.details["copied"].toBool());
     }
+    void inAppCompressionDecision() {
+        auto original = QFileInfo(sample_).dir().filePath("large.mp4");
+        QVERIFY(QFile::copy(sample_, original));
+        QFile f(original);
+        QVERIFY(f.open(QIODevice::ReadWrite));
+        QVERIFY(f.resize(SizeLimit + 1));
+        f.close();
+        auto identity = fileIdentity(original);
+        auto id = window_->exports_.submitCompression(original, "libx264");
+        QTRY_VERIFY_WITH_TIMEOUT(
+            window_->exports_.jobs().last().id == id && window_->exports_.jobs().last().terminal, 30000);
+        auto job = window_->exports_.jobs().last();
+        QVERIFY2(job.state == "Complete", qPrintable(job.message));
+        QTRY_VERIFY(window_->jobs_->count() == window_->exports_.jobs().size());
+        for (int i = 0; i < window_->jobs_->count(); ++i)
+            if (window_->jobs_->item(i)->data(Qt::UserRole).toString() == id)
+                window_->jobs_->setCurrentRow(i);
+        auto *yes = window_->findChild<QPushButton *>("recycleOriginal");
+        auto *no = window_->findChild<QPushButton *>("retainOriginal");
+        QVERIFY(yes && no && yes->isEnabled() && no->isEnabled());
+        QTest::mouseClick(no, Qt::LeftButton);
+        QTRY_COMPARE(window_->exports_.jobs().last().details["deleteDecision"].toString(),
+                     QString("Retained"));
+        QVERIFY(!yes->isEnabled() && !no->isEnabled());
+        QCOMPARE(fileIdentity(original), identity);
+        QVERIFY(QFileInfo::exists(job.output));
+    }
     void externalRenameRecovery() {
         auto original = fileIdentity(sample_);
         QString renamed = QFileInfo(sample_).dir().filePath("renamed.mp4");

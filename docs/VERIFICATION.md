@@ -156,3 +156,41 @@ then hidden-window E_INVALIDARG); prior visible-window evidence remains separate
 Fresh discovery contains 101 video implementations after image filtering, 46 with
 successful synthetic output on this host. Raw video variants remain export-only.
 
+## Windows integration milestone, 2026-11-04
+
+Release build and all seven CTest targets pass. Counts: core 18, media 9,
+compression 14, Windows notification/actions 14 passed plus **one explicit skip**,
+and native UI 10 at each scale factor. The skipped check is native toast popup/
+history delivery: this user has Windows global notifications disabled
+(`ToastEnabled=0`). That preference was inspected read-only and remains unchanged.
+The app always mirrors completed jobs and their actions in the Clips window.
+
+Tests use a separate native process and message-only window to hold the clipboard.
+Transient contention retries successfully; persistent contention through a complete
+compression retains both files, reports the copy failure accurately, offers Retry
+Copy and omits the successful-copy/deletion question. Retry then copies the saved
+output and makes the appropriate decision available. Same-process clipboard locking
+was rejected as inadequate evidence because Windows allowed the other thread to copy.
+
+Native COM activation, strict UUID/action parsing and single-instance delivery pass.
+A test registers the actual clipper executable, asks COM to activate it while stopped,
+invokes No for a persisted job, verifies both identities, checks that no window became
+visible, exits the test instance, and unregisters its test shell registration. This
+proves process-restart activation without requiring a visible main window. Clicking
+an actual delivered Windows toast remains unverified with system notifications off.
+
+Recycle tests move disposable fixtures into the real Windows Recycle Bin using the
+Shell's explicit RecycleItem API. The original is identity-locked and moved by handle
+to a persisted staging location first. No permanent-delete API is used as a fallback.
+Tests verify repeated Yes, No surviving restart, stale replacement rejection, unchanged
+compressed identities, recovery of an interrupted stage, and retention when an open
+handle prevents staging. A Recycle Bin service/volume failure after staging remains
+untested. Native UI tests also create a real compressed file and click the in-app No
+action at 100%, 150% and 200%, retaining both files and disabling further decisions.
+
+Per-user shell registration now supplies Start Menu AUMID/activator properties,
+LocalServer32 and Windows display metadata. First-use Windows 10 settings lookup can
+return ERROR_NOT_FOUND before an app's first toast; the app permits submission in
+that specific case and preserves other errors. API submission is not represented as
+proof that Windows presented a popup.
+

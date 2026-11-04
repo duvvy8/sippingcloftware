@@ -1,6 +1,41 @@
 #include "compression.h"
 #include "jobs.h"
+#include "notifications.h"
+#include "platform.h"
 #include <QtTest>
+class ClipboardHolder {
+    HANDLE event_ = nullptr;
+    QProcess process_;
+    QString ready_;
+
+  public:
+    bool start(const QString &folder) {
+        QString name = "Local\\ClipperClipboard-" + QUuid::createUuid().toString(QUuid::WithoutBraces);
+        event_ = CreateEventW(nullptr, TRUE, FALSE, name.toStdWString().c_str());
+        if (!event_)
+            return false;
+        ready_ = QDir(folder).filePath("clipboard-" + QUuid::createUuid().toString(QUuid::WithoutBraces) +
+                                       ".json");
+        process_.setCreateProcessArgumentsModifier(
+            [](QProcess::CreateProcessArguments *p) { p->flags |= CREATE_NO_WINDOW; });
+        process_.start(QCoreApplication::applicationDirPath() + "/clipboard_fixture.exe", {ready_, name});
+        return process_.waitForStarted(3000);
+    }
+    bool ready() const {
+        return clip::readJson(ready_)["locked"].toBool();
+    }
+    void release() {
+        if (event_)
+            SetEvent(event_);
+        if (process_.state() != QProcess::NotRunning)
+            process_.waitForFinished(5000);
+    }
+    ~ClipboardHolder() {
+        release();
+        if (event_)
+            CloseHandle(event_);
+    }
+};
 class CompressionTests : public QObject {
     Q_OBJECT
     QTemporaryDir tmp_;
@@ -145,9 +180,9 @@ class CompressionTests : public QObject {
     void cancellationRetainsOriginal() {
         std::atomic_bool cancel = true;
         auto before = digest(source_);
-        QVERIFY_EXCEPTION_THROWN(
-            clip::compressMedia(source_, tmp_.filePath("cancelled.mp4"), "libx264", &cancel),
-            std::runtime_error);
+        QVERIFY_THROWS_EXCEPTION(
+            std::runtime_error,
+            clip::compressMedia(source_, tmp_.filePath("cancelled.mp4"), "libx264", &cancel));
         QCOMPARE(digest(source_), before);
         QVERIFY(!QFileInfo::exists(tmp_.filePath("cancelled.mp4")));
     }
@@ -228,6 +263,54 @@ class CompressionTests : public QObject {
         queue.shutdown();
         buffer.stop();
         buffer.clear();
+    }
+    void clipboardFailureAndRetry() {
+        auto original = tmp_.filePath("clipboard-original.mp4");
+        QVERIFY(QFile::copy(source_, original));
+        QFile file(original);
+        QVERIFY(file.open(QIODevice::ReadWrite));
+        QVERIFY(file.resize(clip::SizeLimit + 1));
+        file.close();
+        auto before = digest(original);
+        ClipboardHolder holder;
+        QVERIFY(holder.start(tmp_.path()));
+        QTRY_VERIFY_WITH_TIMEOUT(holder.ready(), 5000);
+        clip::ReplayBuffer buffer;
+        clip::ExportQueue queue(&buffer, nullptr, tmp_.filePath("clipboard-jobs"));
+        auto id = queue.submitCompression(original, "libx264");
+        QTRY_VERIFY_WITH_TIMEOUT(!queue.jobs().isEmpty() && queue.jobs().first().terminal, 30000);
+        auto job = queue.jobs().first();
+        QCOMPARE(job.state, QString("Compressed but clipboard copy failed"));
+        QVERIFY(job.details["copyPending"].toBool());
+        QVERIFY(QFileInfo::exists(job.output));
+        QCOMPARE(digest(original), before);
+        auto xml = clip::notificationXml(job);
+        QVERIFY(xml.contains("Compressed, but could not copy."));
+        QVERIFY(xml.contains("Retry Copy"));
+        QVERIFY(!xml.contains("Delete unreduced"));
+        holder.release();
+        QString error;
+        QVERIFY2(queue.retryCopy(id, &error), qPrintable(error));
+        job = queue.jobs().first();
+        QCOMPARE(job.state, QString("Complete"));
+        QVERIFY(job.details["copied"].toBool());
+        QVERIFY(!job.details["copyPending"].toBool());
+        QVERIFY(clip::notificationXml(job).contains("Delete unreduced file?"));
+        QCOMPARE(digest(original), before);
+    }
+    void shortClipboardContentionRetries() {
+        ClipboardHolder holder;
+        QVERIFY(holder.start(tmp_.path()));
+        QTRY_VERIFY_WITH_TIMEOUT(holder.ready(), 5000);
+        std::atomic_bool done = false, copied = false;
+        std::jthread sender([&] {
+            copied = clip::copyFile(source_);
+            done = true;
+        });
+        QTimer::singleShot(100, this, [&] { holder.release(); });
+        QTRY_VERIFY_WITH_TIMEOUT(done.load(), 5000);
+        QVERIFY(copied.load());
+        QVERIFY(QFileInfo::exists(source_));
     }
 };
 QTEST_GUILESS_MAIN(CompressionTests)

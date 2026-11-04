@@ -1,6 +1,7 @@
 #include "jobs.h"
 #include "platform.h"
 #include "compression.h"
+#include "recycle.h"
 namespace clip {
 QJsonObject ExportJob::json() const {
     QJsonArray segments;
@@ -65,6 +66,13 @@ ExportQueue::ExportQueue(ReplayBuffer *b, QObject *parent, QString storage)
                 "Interrupted by application shutdown or crash. Any finalized original has been retained.";
             j.terminal = true;
             QFile::remove(j.original + ".partial");
+            writeJson(QDir(folder_).filePath(j.id + ".json"), j.json());
+        }
+        if (j.details["deleteDecision"].toString() == "Recycling") {
+            j.details["deleteDecision"] = "Recycle interrupted";
+            j.message = "Recycling was interrupted. Inspect the original location, staged original and "
+                        "Recycle Bin; compressed copy retained. Staged location: " +
+                        j.details["recycleStage"].toString();
             writeJson(QDir(folder_).filePath(j.id + ".json"), j.json());
         }
         jobs_ << j;
@@ -245,9 +253,99 @@ bool ExportQueue::retryCopy(const QString &id, QString *error) {
     bool alreadySmall = job.details["alreadySmall"].toBool();
     update(id, alreadySmall ? "Already within limit" : "Complete",
            alreadySmall ? "Original already meets the limit and was copied to clipboard."
-                 : "File compressed and copied to clipboard. Delete unreduced file?",
+                        : "File compressed and copied to clipboard. Delete unreduced file?",
            true);
     return true;
+}
+bool ExportQueue::decideOriginal(const QString &id, bool recycle, QString *error) {
+    std::lock_guard actionLock(actions_);
+    ExportJob job;
+    auto fail = [&](QString message) {
+        if (error)
+            *error = message;
+        return false;
+    };
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto &j : jobs_)
+            if (j.id == id)
+                job = j;
+    }
+    if (job.id.isEmpty() || !job.terminal || job.state != "Complete" || !job.details["copied"].toBool() ||
+        job.details["alreadySmall"].toBool() || !(job.kind == "compress" || job.kind == "save-compress"))
+        return fail("This job has no original-recycling decision");
+    auto decision = job.details["deleteDecision"].toString();
+    if (decision == "Retained" || decision == "Recycled")
+        return true;
+    if (!QStringList{"Pending", "Recycle failed", "Recycle interrupted"}.contains(decision))
+        return fail("This original-recycling action is stale or already processing");
+    auto finish = [&](const QString &state, const QString &message, const QString &destination = QString()) {
+        {
+            std::lock_guard lock(mutex_);
+            for (auto &j : jobs_)
+                if (j.id == id) {
+                    j.details["deleteDecision"] = state;
+                    if (!destination.isEmpty())
+                        j.details["recycleDestination"] = destination;
+                    j.message = message;
+                }
+            persistLocked();
+        }
+        emit jobChanged(id);
+    };
+    if (!recycle) {
+        const auto expected = job.details["originalIdentity"].toObject();
+        auto stage = job.details["recycleStage"].toString();
+        if (!expected.isEmpty() && !stage.isEmpty() && fileIdentity(stage) == expected &&
+            !QFileInfo::exists(job.original))
+            QFile::rename(stage, job.original);
+        QString location = !expected.isEmpty() && fileIdentity(job.original) == expected ? job.original
+                           : !expected.isEmpty() && fileIdentity(stage) == expected      ? stage
+                                                                                         : QString();
+        finish("Retained",
+               location.isEmpty()
+                   ? "Deletion declined. Existing files retained; the original is unavailable or changed."
+                   : "Both original and compressed copy retained. Original location: " + location);
+        return true;
+    }
+    if (job.output.isEmpty() || job.output == job.original ||
+        fileIdentity(job.output) != job.details["outputIdentity"].toObject())
+        return fail("Compressed copy changed or is unavailable; original retained");
+    const auto identity = job.details["originalIdentity"].toObject();
+    QString stage = job.details["recycleStage"].toString();
+    if (stage.isEmpty())
+        stage = QDir(QFileInfo(job.original).absolutePath())
+                    .filePath(".recycle-" + job.id + '/' + QFileInfo(job.original).fileName());
+    {
+        std::lock_guard lock(mutex_);
+        for (auto &j : jobs_)
+            if (j.id == id) {
+                j.details["recycleStage"] = stage;
+                j.details["deleteDecision"] = "Recycling";
+            }
+        persistLocked(); // A crash after the identity-locked rename can recover the staged location.
+    }
+    QString reason, destination;
+    bool staged = stageForRecycling(job.original, stage, identity, &reason);
+    bool recycled = staged && recycleOnly(stage, identity, &destination, &reason);
+    if (recycled) {
+        QDir().rmdir(QFileInfo(stage).absolutePath());
+        finish("Recycled", "Corresponding original moved to the Recycle Bin. Compressed copy retained.",
+               destination);
+        return true;
+    }
+    if (fileIdentity(stage) == identity && !QFileInfo::exists(job.original))
+        QFile::rename(stage, job.original);
+    QString retained = fileIdentity(job.original) == identity ? job.original
+                       : fileIdentity(stage) == identity      ? stage
+                                                              : QString();
+    if (!retained.isEmpty())
+        reason += " Original retained at: " + retained;
+    else
+        reason +=
+            " Original location could not be confirmed; inspect the Recycle Bin. Compressed copy retained.";
+    finish("Recycle failed", reason);
+    return fail(reason);
 }
 void ExportQueue::shutdown() {
     {
@@ -333,6 +431,13 @@ void ExportQueue::run() {
                                                            {"parent", job.original},
                                                            {"media", info.json()}}))
                     throw std::runtime_error("Edited file saved, but metadata could not be persisted");
+                {
+                    std::lock_guard lock(mutex_);
+                    for (auto &j : jobs_)
+                        if (j.id == job.id)
+                            j.details["outputIdentity"] = fileIdentity(job.output);
+                    persistLocked();
+                }
                 update(job.id, "Complete", "Edited copy saved; original retained", true);
             } else if (job.kind != "compress") {
                 update(job.id, "Saving original", "Waiting for final packets at the selected endpoint");
@@ -361,6 +466,13 @@ void ExportQueue::run() {
                                     {"media", info.json()}};
                 if (!writeJson(job.original + ".clip.json", sidecar))
                     throw std::runtime_error("Clip saved, but metadata could not be written");
+                {
+                    std::lock_guard lock(mutex_);
+                    for (auto &j : jobs_)
+                        if (j.id == job.id)
+                            j.details["originalIdentity"] = fileIdentity(job.original);
+                    persistLocked();
+                }
                 buffer_->release(job.source.id);
                 if (job.kind == "save")
                     update(job.id, "Complete", "Clip saved and completely decoded", true);
