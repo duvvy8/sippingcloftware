@@ -1,5 +1,6 @@
 #include "jobs.h"
 #include "platform.h"
+#include "compression.h"
 namespace clip {
 QJsonObject ExportJob::json() const {
     QJsonArray segments;
@@ -80,10 +81,11 @@ void ExportQueue::persistLocked() {
                 "Cannot persist export job. Check available disk space and folder access.");
 }
 QString ExportQueue::submitSave(const Interval &source, const Settings &s, const QString &app,
-                                const QString &exe) {
+                                const QString &exe, bool compress) {
     ExportJob j;
     j.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     j.source = source;
+    j.kind = compress ? "save-compress" : "save";
     j.settings = s;
     j.application = app;
     j.executable = exe;
@@ -92,6 +94,36 @@ QString ExportQueue::submitSave(const Interval &source, const Settings &s, const
     j.original = uniquePath(
         root, QDateTime::currentDateTime().toString("yyyy-MM-dd_HH-mm-ss-zzz") + '_' + j.id.left(8),
         s.container);
+    {
+        std::lock_guard lock(mutex_);
+        if (stopping_)
+            throw std::runtime_error("Export queue is stopping");
+        jobs_ << j;
+        try {
+            persistLocked();
+        } catch (...) {
+            jobs_.removeLast();
+            throw;
+        }
+        buffer_->narrow(source.id, source.start, source.end);
+        changed_.notify_all();
+    }
+    emit jobChanged(j.id);
+    return j.id;
+}
+QString ExportQueue::submitCompression(const QString &original, const QString &encoder) {
+    ExportJob j;
+    j.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    j.kind = "compress";
+    j.original = original;
+    j.settings.encoder = encoder;
+    j.created = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+    j.details["sourceIdentity"] = fileIdentity(original);
+    if (j.details["sourceIdentity"].toObject().isEmpty())
+        throw std::runtime_error("Original is unavailable");
+    auto sidecar = readJson(original + ".clip.json");
+    j.application = sidecar["application"].toString(QFileInfo(original).dir().dirName());
+    j.executable = sidecar["executable"].toString();
     {
         std::lock_guard lock(mutex_);
         if (stopping_)
@@ -129,7 +161,7 @@ QString ExportQueue::submitEdit(const QString &original, const EditRequest &requ
         throw std::runtime_error("Original is unavailable");
     job.output = uniquePath(QFileInfo(original).absolutePath(),
                             QFileInfo(original).completeBaseName() + "_edited_" + job.id.left(8),
-                            QFileInfo(original).suffix());
+                            request.sdr ? "mp4" : QFileInfo(original).suffix());
     {
         std::lock_guard lock(mutex_);
         if (stopping_)
@@ -184,6 +216,38 @@ void ExportQueue::cancel(const QString &id) {
             emit queueError(QString::fromUtf8(e.what()));
         }
     emit jobChanged(id);
+}
+bool ExportQueue::retryCopy(const QString &id, QString *error) {
+    ExportJob job;
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto &j : jobs_)
+            if (j.id == id && j.terminal && j.details["copyPending"].toBool())
+                job = j;
+    }
+    if (job.id.isEmpty() || job.output.isEmpty() ||
+        fileIdentity(job.output) != job.details["outputIdentity"].toObject()) {
+        if (error)
+            *error = "The saved output changed or this job has no pending clipboard copy";
+        return false;
+    }
+    if (!copyFile(job.output, error))
+        return false;
+    {
+        std::lock_guard lock(mutex_);
+        for (auto &j : jobs_)
+            if (j.id == id) {
+                j.details["copyPending"] = false;
+                j.details["copied"] = true;
+            }
+        persistLocked();
+    }
+    bool alreadySmall = job.details["alreadySmall"].toBool();
+    update(id, alreadySmall ? "Already within limit" : "Complete",
+           alreadySmall ? "Original already meets the limit and was copied to clipboard."
+                 : "File compressed and copied to clipboard. Delete unreduced file?",
+           true);
+    return true;
 }
 void ExportQueue::shutdown() {
     {
@@ -270,7 +334,7 @@ void ExportQueue::run() {
                                                            {"media", info.json()}}))
                     throw std::runtime_error("Edited file saved, but metadata could not be persisted");
                 update(job.id, "Complete", "Edited copy saved; original retained", true);
-            } else {
+            } else if (job.kind != "compress") {
                 update(job.id, "Saving original", "Waiting for final packets at the selected endpoint");
                 auto resolved = buffer_->resolve(job.source.id, &cancel_);
                 resolved.start = qMax(resolved.start, job.source.start);
@@ -297,7 +361,95 @@ void ExportQueue::run() {
                                     {"media", info.json()}};
                 if (!writeJson(job.original + ".clip.json", sidecar))
                     throw std::runtime_error("Clip saved, but metadata could not be written");
-                update(job.id, "Complete", "Clip saved and completely decoded", true);
+                buffer_->release(job.source.id);
+                if (job.kind == "save")
+                    update(job.id, "Complete", "Clip saved and completely decoded", true);
+            }
+            if (job.kind == "compress" || job.kind == "save-compress") {
+                if (job.kind == "compress" &&
+                    fileIdentity(job.original) != job.details["sourceIdentity"].toObject())
+                    throw std::runtime_error("Original changed since compression was queued");
+                auto originalIdentity = fileIdentity(job.original);
+                auto output =
+                    uniquePath(QFileInfo(job.original).absolutePath(),
+                               QFileInfo(job.original).completeBaseName() + "_compressed_" + job.id.left(8),
+                               QFileInfo(job.original).suffix());
+                QElapsedTimer throttle;
+                throttle.start();
+                QString lastState, lastMessage;
+                auto result = compressMedia(job.original, output, job.settings.encoder, &cancel_,
+                                            [&](QString state, QString message, double progress) {
+                                                if (state == lastState && message == lastMessage &&
+                                                    throttle.elapsed() < 250)
+                                                    return;
+                                                throttle.restart();
+                                                lastState = state;
+                                                lastMessage = message;
+                                                {
+                                                    std::lock_guard lock(mutex_);
+                                                    for (auto &j : jobs_)
+                                                        if (j.id == job.id)
+                                                            j.progress = progress;
+                                                }
+                                                update(job.id, state, message);
+                                            });
+                {
+                    std::lock_guard lock(mutex_);
+                    for (auto &j : jobs_)
+                        if (j.id == job.id) {
+                            j.output = result.output;
+                            j.details["originalIdentity"] = originalIdentity;
+                            j.details["attempts"] = result.attempts;
+                            j.details["quality"] = result.quality.json();
+                            j.details["limitingReason"] = result.reason;
+                            j.details["alreadySmall"] = result.state == "Already within limit";
+                            if (!result.output.isEmpty())
+                                j.details["outputIdentity"] = fileIdentity(result.output);
+                        }
+                    persistLocked();
+                }
+                if (result.state == "Cannot meet constraints") {
+                    update(job.id, result.state, "File was too big to reduce to 20MB. " + result.reason,
+                           true);
+                } else {
+                    bool alreadySmall = result.state == "Already within limit";
+                    if (!alreadySmall &&
+                        !writeJson(result.output + ".clip.json", {{"id", job.id},
+                                                                  {"application", job.application},
+                                                                  {"executable", job.executable},
+                                                                  {"created", job.created},
+                                                                  {"relationship", "compressed"},
+                                                                  {"parent", job.original},
+                                                                  {"media", result.media.json()},
+                                                                  {"quality", result.quality.json()}}))
+                        throw std::runtime_error(
+                            "Compressed copy saved, but metadata could not be persisted");
+                    update(job.id, "Copying", "Copying the saved file to the clipboard");
+                    QString error;
+                    bool copied = copyFile(result.output, &error);
+                    {
+                        std::lock_guard lock(mutex_);
+                        for (auto &j : jobs_)
+                            if (j.id == job.id) {
+                                j.details["copyPending"] = !copied;
+                                j.details["deleteDecision"] = alreadySmall ? "Not applicable" : "Pending";
+                                j.details["copied"] = copied;
+                            }
+                        persistLocked();
+                    }
+                    if (!copied)
+                        update(job.id, alreadySmall ? "Failed" : "Compressed but clipboard copy failed",
+                               (alreadySmall ? "Original already fits, but could not copy. "
+                                             : "Compressed, but could not copy. ") +
+                                   error,
+                               true);
+                    else
+                        update(job.id, alreadySmall ? "Already within limit" : "Complete",
+                               alreadySmall
+                                   ? "Original already meets the limit and was copied to clipboard."
+                                   : "File compressed and copied to clipboard. Delete unreduced file?",
+                               true);
+                }
             }
         } catch (const std::exception &e) {
             try {

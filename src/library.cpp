@@ -1,5 +1,6 @@
 #include "library.h"
 #include "platform.h"
+#include "replay_storage.h"
 namespace clip {
 QJsonObject ClipRecord::json() const {
     return {{"path", path},       {"application", application},
@@ -38,6 +39,7 @@ void Library::refresh(const QString &root) {
     cancel_ = false;
     emit status("Reading clip index…");
     scan_ = std::thread([this, root] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         QList<ClipRecord> items;
         QMap<QString, ClipRecord> byIdentity;
         auto cache = readJson(stateDir() + "/library-index.json");
@@ -49,6 +51,9 @@ void Library::refresh(const QString &root) {
                         QDirIterator::Subdirectories);
         while (it.hasNext() && !cancel_) {
             auto path = it.next();
+            if (readJson(QFileInfo(path).dir().filePath("session.json"))["owner"].toString() ==
+                ReplayStorage::Owner)
+                continue;
             auto identity = fileIdentity(path);
             auto key = identity["volume"].toString() + ":" + identity["file"].toString();
             ClipRecord r;

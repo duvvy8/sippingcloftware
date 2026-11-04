@@ -68,7 +68,8 @@ int main(int argc, char **argv) {
             std::this_thread::sleep_for(std::chrono::seconds(seconds));
             double endpoint = clip::clockSeconds();
             auto pin = recorder.buffer().pin(endpoint, 3.);
-            std::this_thread::sleep_for(std::chrono::milliseconds(700));
+            int delay = args.contains("--post-delay") ? value("--post-delay").toInt() : 700;
+            std::this_thread::sleep_for(std::chrono::milliseconds(qMax(0, delay)));
             recorder.stop();
             auto resolved = recorder.buffer().resolve(pin.id);
             auto output = QFileInfo(value("--record-smoke")).absolutePath() + "/capture-" +

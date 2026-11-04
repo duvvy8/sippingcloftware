@@ -18,7 +18,7 @@ class ClipToolbar : public QWidget {
     double endpoint_ = 0;
     QComboBox *container_, *fps_, *resolution_, *duration_, *quality_, *encoder_;
     QLabel *available_;
-    QPushButton *record_, *save_;
+    QPushButton *record_, *save_, *compress_;
     void release();
 
   protected:
@@ -29,7 +29,7 @@ class ClipToolbar : public QWidget {
     explicit ClipToolbar(MainWindow *);
     ~ClipToolbar();
     void open();
-    void submit();
+    void submit(bool compress = false);
 };
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -61,6 +61,7 @@ class MainWindow : public QMainWindow {
     QTimer timer_;
     QSet<QString> completedSeen_;
     bool libraryRefreshPending_ = false;
+    bool resetApproved_ = false;
     QWidget *clipsPage();
     QWidget *recordingPage();
     QWidget *settingsPage();
@@ -76,8 +77,10 @@ class MainWindow : public QMainWindow {
     void probeEncoders();
     void showError(const QString &);
     void showPlayer(const QString &);
-    void showEditor(int tab);
+    void showEditor(int tab, bool sdr = false);
     void calibrate();
+    void updateCaptureChoices();
+    bool approveSdrRecording(Settings &);
     void closeEvent(QCloseEvent *) override;
 
   public:

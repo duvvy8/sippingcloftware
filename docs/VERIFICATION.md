@@ -80,8 +80,8 @@ of an interrupted persisted job without changing its original file bytes.
 
 The Computer Use helper read the app's accessibility tree but repeatedly failed
 screen capture (`window capture timed out`) and returned `coordinate input geometry
-is unavailable` during input. An OS screenshot captured the occluding full-screen
-game rather than the app. No interaction with that game was performed. Qt integration
+is unavailable` during input. An OS screenshot captured other desktop content
+rather than the app; its owning process was not identified. Qt integration
 tests and app-owned widget rendering were used for verification. Actual interactive
 overlay placement/exclusion over a game remains unverified.
 
@@ -96,7 +96,7 @@ overlay placement/exclusion over a game remains unverified.
 
 ## Release gates still open
 
-Remaining capture/audio reliability, full toolbar-save integration, editing, HDR, compression and VMAF,
+Remaining capture/audio reliability, full toolbar-save integration, compression and VMAF,
 clipboard, interactive persistent notifications, resource/game performance,
 installer and installed-app verification are unfinished. The goal remains active.
 
@@ -105,4 +105,54 @@ installer and installed-app verification are unfinished. The goal remains active
 All five CTest targets pass: core (13 checks), media (8 checks), and native UI (8 checks each at 100/150/200%). Media checks cover exact and keyframe-rounded fast trimming of a B-frame source, full decode, crop dimensions, portrait fitting with black bars, selected-track gain ratio, muted sharing mix, cancellation cleanup, unchanged SHA256 originals, and two serial immutable interval saves with retained audio. Native UI tests export an edited file and verify editor/player destruction at all three scales. The 200% editor render was visually inspected; export/cancel controls remain visible.
 
 Fast trim initially failed duration validation because command-line timestamp shifting retained extra footage. Packet-level remux now explicitly selects the disclosed GOP interval, rebases timestamps and validates the complete output. No duration tolerance was weakened.
+
+## Resume verification, 2026-11-04
+
+The Release build and all five existing CTest targets passed after the PC restart.
+Core now has 18 passing checks, including active-segment byte reservation,
+contiguous available duration, refusal to shorten an unavailable endpoint, replay
+session recovery and preservation of a file with a substituted identity. Media
+has nine passing checks including HDR mastering/CLL metadata preservation through
+an edit and explicit tone-mapped BT.709 output with HDR metadata removed.
+
+HDR conversion has numerical half-float/scRGB/PQ tests and actual 10-bit software
+encode/decode checks. Prior synthetic probes also decoded 10-bit NVIDIA H.264,
+HEVC and AV1, and AMD HEVC on this machine. These do **not** verify real HDR
+monitor capture, HDR presentation, Intel hardware, Windows 11, or visual HDR
+accuracy. Both attached displays are SDR.
+
+Compression implementation and tests are in progress and are not yet a verified
+user workflow. Installer and persistent interactive notifications remain required.
+
+## Compression milestone, 2026-11-04
+
+Six CTest targets pass: core (18 checks), media (9), compression (12), and native
+UI at 100%, 150% and 200% (9 each). Compression checks cover the ordered resolution
+and frame-rate policy, no upscale/increase for a 240x426/12fps source, fifth-percentile
+outlier rejection, exact 20,000,000-byte handling, complete H.264/MP4 compression,
+severe degradation rejection, a retained-audio budget failure, noisy >20MB FFV1
+constraint failure, cancellation during encoding, temporary cleanup, and a real
+serial save-and-compress job. Native UI tests click the library Auto Compress button.
+
+The H.264 success fixture adds validly ignored padding to cross the byte boundary;
+it proves the size gate and complete encode/score/validate workflow, **not** that
+difficult gaming content can be reduced successfully. The lossless rejection
+fixture contains actual noisy encoded frames above 20MB. Representative gaming
+visual checks (HUD, foliage, particles, dark scenes and motion), wider codecs,
+HDR scoring and full ladder encodes remain open.
+
+Acceptance compares actual finalized bytes, source codec/container, display aspect,
+colour fields/available HDR metadata, intended audio stream descriptions and exact
+SHA256 hashes of retained audio packet payloads. Selected output undergoes full
+decoding and every-frame VMAF at the original display resolution/frame rate. Both
+HDR scoring inputs use the same controlled SDR transform; actual output remains HDR.
+This HDR scoring path is implemented but not yet runtime verified.
+
+Post-restart native WGC and DXGI monitor capture saved 1280x720/60 H.264 files with
+zero dropped frames/backlog and unchanged pinned endpoints. WGC duration was 3s;
+DXGI was 2.983333s, within the required one-frame rounding tolerance. The hidden
+window fixture was unavailable for WGC window capture in this run (first not ready,
+then hidden-window E_INVALIDARG); prior visible-window evidence remains separate.
+Fresh discovery contains 101 video implementations after image filtering, 46 with
+successful synthetic output on this host. Raw video variants remain export-only.
 

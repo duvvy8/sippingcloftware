@@ -3,7 +3,7 @@
 namespace clip {
 struct EditRequest {
     double start = 0, end = 0;
-    bool fast = false, crop = false, fit = true, mixAudio = false;
+    bool fast = false, crop = false, fit = true, mixAudio = false, sdr = false;
     QRect region;
     QString aspect = "Source";
     QList<int> tracks;

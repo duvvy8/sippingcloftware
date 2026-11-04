@@ -110,6 +110,11 @@ EditorDialog::EditorDialog(const QString &path, const QString &encoder, int tab,
     trim->addRow("Start", start_);
     trim->addRow("End", end_);
     trim->addRow("Method", mode_);
+    sdr_ = new QCheckBox("Create an explicit tone-mapped SDR sharing copy (H.264 / MP4)");
+    sdr_->setEnabled(info_.hdr);
+    sdr_->setToolTip(info_.hdr ? "Converts HDR pixels into BT.709 SDR; keeps the original HDR file"
+                               : "This clip is already SDR");
+    trim->addRow(sdr_);
     tabs->addTab(scrollPage(trimPage), "Trim");
     auto *cropPage = new QWidget;
     auto *cropLayout = new QFormLayout(cropPage);
@@ -149,8 +154,8 @@ EditorDialog::EditorDialog(const QString &path, const QString &encoder, int tab,
         auto *include = new QCheckBox;
         include->setChecked(true);
         audio_->setCellWidget(i, 0, include);
-        auto *title =
-            new QTableWidgetItem(i == 0 ? "Track 1 · compatibility mix" : QString("Track %1").arg(i + 1));
+        auto *title = new QTableWidgetItem(
+            info_.audioStreams.at(i).toObject()["title"].toString(QString("Track %1").arg(i + 1)));
         title->setFlags(title->flags() & ~Qt::ItemIsEditable);
         audio_->setItem(i, 1, title);
         auto *gain = new QDoubleSpinBox;
@@ -252,6 +257,7 @@ EditorDialog::EditorDialog(const QString &path, const QString &encoder, int tab,
     connect(mode_, &QComboBox::currentIndexChanged, this, &EditorDialog::updateResult);
     connect(aspect_, &QComboBox::currentIndexChanged, this, &EditorDialog::updateResult);
     connect(mix_, &QCheckBox::toggled, this, &EditorDialog::updateResult);
+    connect(sdr_, &QCheckBox::toggled, this, &EditorDialog::updateResult);
     updateResult();
 }
 EditorDialog::~EditorDialog() {
@@ -270,6 +276,7 @@ EditRequest EditorDialog::request() const {
     r.aspect = aspect_->currentText();
     r.region = {x_->value(), y_->value(), w_->value(), h_->value()};
     r.mixAudio = mix_->isChecked();
+    r.sdr = sdr_->isChecked();
     for (int i = 0; i < info_.audioTracks; ++i)
         if (qobject_cast<QCheckBox *>(audio_->cellWidget(i, 0))->isChecked()) {
             r.tracks << i;

@@ -68,7 +68,8 @@ int main(int argc, char **argv) {
         u16(quint16(sample));
         u16(quint16(sample));
     }
-    PlaySoundW(reinterpret_cast<LPCWSTR>(wave.constData()), nullptr, SND_MEMORY | SND_ASYNC | SND_LOOP);
+    if (app.arguments().contains("--tone"))
+        PlaySoundW(reinterpret_cast<LPCWSTR>(wave.constData()), nullptr, SND_MEMORY | SND_ASYNC | SND_LOOP);
     Pattern w;
     w.show();
     int result = app.exec();

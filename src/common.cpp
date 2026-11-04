@@ -77,8 +77,10 @@ QString ffmpegPath() {
     return QCoreApplication::applicationDirPath() + "/ffmpeg.exe";
 }
 ProcessResult runProcess(const QString &exe, const QStringList &args, int timeout, std::atomic_bool *cancel,
-                         std::function<void(QByteArray)> output) {
+                         std::function<void(QByteArray)> output, const QString &workingDirectory) {
     QProcess p;
+    if (!workingDirectory.isEmpty())
+        p.setWorkingDirectory(workingDirectory);
     p.setProgram(exe);
     p.setArguments(args);
     p.setProcessChannelMode(QProcess::MergedChannels);
@@ -158,6 +160,7 @@ QJsonObject Settings::json() const {
             {"retention", retention},
             {"bufferBytes", bufferBytes},
             {"hdr", hdr},
+            {"toneMapCapture", toneMapCapture},
             {"startup", startup},
             {"autoRecord", autoRecord},
             {"notifications", notifications},
@@ -186,6 +189,7 @@ void Settings::loadObject(const QJsonObject &o) {
     retention = o["retention"].toInt(300);
     bufferBytes = o["bufferBytes"].toInteger(bufferBytes);
     hdr = o["hdr"].toBool();
+    toneMapCapture = o["toneMapCapture"].toBool();
     startup = o["startup"].toBool();
     autoRecord = o["autoRecord"].toBool();
     notifications = o["notifications"].toBool(true);

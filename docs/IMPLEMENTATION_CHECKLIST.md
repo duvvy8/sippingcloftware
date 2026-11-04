@@ -20,7 +20,7 @@ No release or goal completion until all mandatory implementation is finished.
 | ID | Requirement | Status / evidence |
 |---|---|---|
 | H01 | Enumerate adapters and attached displays, capture adapter affinity | Tested discovery: AMD Radeon iGPU, NVIDIA RTX 5070 Ti; 2560x1440@240 and 1080x1920@144 SDR displays. Capture opens matching display adapter; calibration pending. |
-| H02 | Complete FFmpeg video encoder catalogue; exclude still-image/unsuitable streams | Tested: 120 video encoders discovered through av_codec_iterate; catalogue test excludes image formats and retains FFV1. |
+| H02 | Complete FFmpeg video encoder catalogue; exclude still-image/unsuitable streams | Partially tested: 101 video implementations remain after still-image exclusion; raw streams retained as export-only. Catalogue regression tests pass; wider specialist configuration tests remain open. |
 | H03 | Separate build inclusion, hardware match, initialization, encoded-frame verification | Tested: isolated child probes; 48 successful packet-output tests / 120 catalogue records. Absent hardware and initialization failures retain reasons. |
 | H04 | Live/export classification, reasons, identity/device/pixel formats/rate controls | Implemented / partially tested: catalogue records implementation, queried pixel formats and private controls, hardware flags and detailed reasons. Live recommendation deliberately gated on calibration. |
 | H05 | Codec/container compatibility, tested configurations, HDR capability | Implemented / partially tested: avformat_query_codec compatibility, exact 640x360@60 synthetic configurations recorded. HDR probes pending. |
@@ -32,14 +32,14 @@ No release or goal completion until all mandatory implementation is finished.
 ## 3. Capture, audio, storage and saves
 | ID | Requirement | Status / evidence |
 |---|---|---|
-| C01 | WGC/D3D11 window and monitor capture; DXGI monitor fallback | Tested WGC window capture and H.264 NVENC save at 1226x720/60 on this host; source image changes verified via 11 distinct hashes in 15 sampled frames. DXGI and device-loss paths remain untested. |
+| C01 | WGC/D3D11 window and monitor capture; DXGI monitor fallback | Partially tested: prior WGC window save/changing-content verification; after restart WGC and DXGI monitor saves at 1280x720/60, zero dropped/backlog, fixed 3s intervals, completely decoded. DXGI output 2.983333s within one-frame tolerance; WGC 3s. Device-loss paths remain untested. |
 | C02 | Monotonic timestamps; retain source identity before toolbar focus | Pending |
 | C03 | Disk ring: independent compressed ~2s segments, default 300s / 4 GiB | Implemented / untested: recorder and replay.cpp; independent ~2s Matroska segments, defaults 300s / 4 GiB. |
 | C04 | Configurable storage/limits; duration and bytes whichever first, actual duration | Tested ring duration/byte limits and actual interval duration in core tests. Settings expose storage path, duration and byte limits. |
 | C05 | Bounded queues; dropped frames/backlog and actionable performance guidance | Implemented / untested: bounded 16-frame capture queue, backlog/drop stats, stop when lag exceeds 2s; UI guidance pending. |
 | C06 | Fixed toolbar endpoint; interval pinning; release/transfer pin ownership | Tested fixed and delayed endpoints, pin eviction protection, multiple pins and partial intervals; Qt toolbar Escape releases its pin. Queued toolbar interval integration still needs a full recording exercise. |
 | C07 | Partial buffer disclosure; delayed packet coverage; immutable multiple queued saves | Partially tested: real fixed endpoint with 700ms delay; media integration test queues two distinct saves and verifies requested 2s/3s durations, retained tracks, full decoding and immutable 30fps settings after caller mutation. Hardware delayed-packet stress remains open. |
-| C08 | Safe disk exhaustion/failure, preserve clips, crash recovery | Pending |
+| C08 | Safe disk exhaustion/failure, preserve clips, crash recovery | Partially tested: replay session journal, process-creation ownership, guarded file-identity cleanup, active-segment byte reservations; recovery/substituted-file/limit tests pass. Actual forced disk exhaustion/process-crash exercise remains open. |
 | C09 | Overlay exclusion, display changes, sleep/resume, device loss | Pending |
 | C10 | No silent recording changes; restart/buffer reset requires approval | Pending |
 | A01 | WASAPI system/device, microphone and supported per-process loopback | Implemented / untested: WASAPI endpoint capture and process-loopback activation. Host build 19045 does not support per-application loopback (requires >=20348). |
@@ -58,7 +58,7 @@ No release or goal completion until all mandatory implementation is finished.
 | U03 | Keyboard navigation and usable 100/150/200% display scaling | Partially tested: native Qt integration tests and rendered Clips layouts at QT_SCALE_FACTOR 1, 1.5 and 2; no clipped primary controls. Desktop helper screenshot/input geometry failed over a full-screen game, so live overlay interaction remains unverified. |
 | U04 | Clips / Recording / Settings; tray close, explicit Exit stops, initially off | Partially tested: Clips/Recording/Settings, tray, close hides and explicit Exit. Initial recording/startup disabled. Real sign-in startup and exit while recording still untested. |
 | U05 | Hidden toolbar, vertical left of active display, no full-screen dimming | Implemented / partially tested: hidden vertical toolbar, left active-display placement, no dimming, Windows exclusion API succeeds in Qt UI test. Live monitor exclusion verification pending. |
-| U06 | Ordered record/container/fps/resolution/duration/compress/save/folder controls | Partial: start-stop/container/fps/resolution/duration/save/folder connected. Auto Compress awaits sequence step 7; not represented as complete. |
+| U06 | Ordered record/container/fps/resolution/duration/compress/save/folder controls | Implemented / partially tested: required order including Auto Compress connected; empty-buffer buttons disabled in native UI tests. Actual recording-to-toolbar compression interaction remains open. |
 | U07 | Duration presets/custom; source/lower fps including 15/30/60/120 | Implemented / partially tested: toolbar presets and custom duration, source fps plus 120/60/30/15; unavailable higher choices disabled with reasons. |
 | U08 | Applicable source/lower resolutions and compatible MP4/MKV/WebM/MOV | Implemented / partially tested: applicable lower export resolutions and compatible containers; retrospective higher dimensions disabled. Wider codec/configuration verification pending. |
 | U09 | Four quality presets; adjacent advanced codec/encoder panels/tooltips | Partial: four quality presets and adjacent codec/implementation selector connected. Separate codec grouping and additional encoder controls still need refinement. |
@@ -70,7 +70,7 @@ No release or goal completion until all mandatory implementation is finished.
 | L01 | Thumbnail/app/date/duration/dimensions/fps/codec/container/size metadata | Partially tested: indexed metadata displayed, generated media imported, on-demand thumbnail produced, Clips snapshots checked. |
 | L02 | Original/compressed/edited relation; audio-track count and HDR status | Implemented / partially tested: metadata includes relationship, track count and HDR; relation flows for edits/compression pending. |
 | L03 | Application filter/search; lazy cached thumbnails, no continuous scanning | Implemented / partially tested: app filtering/search, cached lazy thumbnails and explicit/event-based scans; idle resource measurement pending. |
-| L04 | Play/show folder/copy/rename/trim/crop/audio/compress actions | Partial: Play/Folder/Copy/Rename/Trim/Crop/Audio connected; native UI exports a real edited clip and releases playback resources. Auto Compress remains in step 7. |
+| L04 | Play/show folder/copy/rename/trim/crop/audio/compress actions | Partially tested: native playback/edit/copy/rename workflows plus actual library Auto Compress button queues an already-small original and copies it, without a duplicate, at all three scales. Larger library compression cases remain open. |
 | L05 | Rebuildable local index/sidecars; recover external rename/delete | Tested: external rename preserves Windows file identity and rebuilt index finds renamed media; deletion recovery untested. |
 
 ## 5. Playback and nondestructive editing
@@ -86,10 +86,10 @@ No release or goal completion until all mandatory implementation is finished.
 ## 6. HDR
 | ID | Requirement | Status / evidence |
 |---|---|---|
-| D01 | Float capture pipeline and supported 10-bit encode | Pending |
-| D02 | Preserve primaries/transfer/matrix/range/available metadata | Pending |
-| D03 | Preserve HDR and explicit tone-mapped SDR copy; never relabel/convert silently | Pending |
-| D04 | Unsupported combinations disabled with reasons | Pending |
+| D01 | Float capture pipeline and supported 10-bit encode | Partially tested: WGC FP16/scRGB conversion, numerical half-float/PQ tests and actual 10-bit x265 decode pass. NVIDIA H.264/HEVC/AV1 and AMD HEVC synthetic 10-bit probes passed. Real HDR display capture untested. |
+| D02 | Preserve primaries/transfer/matrix/range/available metadata | Partially tested: media integration preserves BT.2020/PQ, mastering and CLL metadata through an edit. Real capture metadata/hardware HDR output remain untested. |
+| D03 | Preserve HDR and explicit tone-mapped SDR copy; never relabel/convert silently | Partially tested: explicit SDR edit produces BT.709 and removes HDR metadata; HDR originals retained. Real HDR visual assessment remains open. |
+| D04 | Unsupported combinations disabled with reasons | Implemented / partially tested: capture checks HDR display and verified 10-bit encoder; explicit consent for SDR capture of HDR display. UI on real HDR hardware untested. |
 
 ## 7. Compression, jobs, cancellation
 | ID | Requirement | Status / evidence |
@@ -98,26 +98,26 @@ No release or goal completion until all mandatory implementation is finished.
 | J02 | Serial export queue below capture priority; progress/settings/cancel | Partially tested: one below-normal export worker and child processes; editable progress and cancellation implemented. Multiple save jobs and edit cancellation cleanup pass. Compression path pending. |
 | J03 | Persist preferences/audio/shortcuts/folders/cache/relations/actions | Partial: settings/audio/shortcuts/folders/cache/save jobs and sidecar relationships persisted; outstanding notification actions later. |
 | J04 | Crash/restart marks interrupted jobs; retains originals, no false success | Tested persistence recovery: interrupted job becomes Failed and original bytes remain untouched. Process-crash integration pending. |
-| Q01 | Save/finalize/validate original first; retain unless explicitly recycled | Pending |
-| Q02 | <=20,000,000 bytes; 19.5MB internal target; no shortening or recording changes | Pending |
-| Q03 | Preserve codec/container/aspect/colour/intended tracks; same-codec implementation allowed | Pending |
-| Q04 | Already small: copy only original, no duplicate or deletion prompt | Pending |
-| Q05 | Every candidate from original; retained audio budget / container allowance | Pending |
-| Q06 | Original dimensions/fps with stronger efficiency/strength first | Pending |
-| Q07 | >60fps then 60, lower resolution ladder, then 30/24/20/15 with reconsideration | Pending |
-| Q08 | Aspect/alignment, no upscale/fps increase; retain below 480p/15fps | Pending |
-| Q09 | Representative high-motion sample shortlist and full VMAF mean>=90/p5>=80 | Pending |
-| Q10 | Consistent display resolution and identical HDR SDR comparison transforms | Pending |
-| Q11 | Full decode, codec/container/tracks/colour/size and duration tolerance validation | Pending |
-| Q12 | Distinct final output, rejected temp cleanup, cancellation retains original | Pending |
-| Q13 | Specific failures incl audio budget/lossless; no mathematical impossibility claim | Pending |
+| Q01 | Save/finalize/validate original first; retain unless explicitly recycled | Partially tested: queued save-and-compress validates 3s original before analysis/copy, immutable 30fps snapshot and original retained. Larger capture-to-compression exercise remains open. |
+| Q02 | <=20,000,000 bytes; 19.5MB internal target; no shortening or recording changes | Partially tested: actual finalized-byte validation, exact 20MB boundary and 20MB+1 padded source processed; unchanged original hash and duration checks pass. Representative gaming input remains open. |
+| Q03 | Preserve codec/container/aspect/colour/intended tracks; same-codec implementation allowed | Partially tested: H.264/MP4 encode retains BT.709, display aspect, audio codec/layout/title and exact audio packet SHA256. Other codec/container/HDR combinations remain open. |
+| Q04 | Already small: copy only original, no duplicate or deletion prompt | Tested through queue and native library action: output is original, no duplicate, real file clipboard, deleteDecision Not applicable. Notification delivery not yet implemented. |
+| Q05 | Every candidate from original; retained audio budget / container allowance | Partially tested: original is each encode input; actual audio packet bytes subtracted with 1%/64KiB minimum mux allowance. 70s PCM audio-budget failure retains original. |
+| Q06 | Original dimensions/fps with stronger efficiency/strength first | Partially tested: candidate policy verifies three descending bitrate targets before geometry/rate changes; FFV1 avoids duplicate ineffective bitrate tests. Wider encoder efficiency verification open. |
+| Q07 | >60fps then 60, lower resolution ladder, then 30/24/20/15 with reconsideration | Tested candidate policy ordering at 3840x2160/120; full media encodes at every ladder stage remain untested. |
+| Q08 | Aspect/alignment, no upscale/fps increase; retain below 480p/15fps | Partially tested: candidate bounds/order plus 240x426/12fps retention; final display-aspect validation implemented. Anamorphic/ultrawide media verification open. |
+| Q09 | Representative high-motion sample shortlist and full VMAF mean>=90/p5>=80 | Partially tested: whole-source YDIF analysis chooses high-motion plus start/mid/end; sample shortlist and every-frame full VMAF implemented. Full synthetic encode passes; severe 32x18/CRF45 degradation and percentile outlier guard rejected. Gaming visual assessment remains open. |
+| Q10 | Consistent display resolution and identical HDR SDR comparison transforms | Implemented / partially tested: both inputs normalized to original dimensions/fps; lower-fps duplication scored. Identical controlled peak=10 HDR-to-SDR transform applied to both score streams only. HDR scoring runtime test open. |
+| Q11 | Full decode, codec/container/tracks/colour/size and duration tolerance validation | Partially tested: complete H.264/MP4 output validated and decoded, actual bytes and duration, exact audio payload hashes. Wider formats/HDR remain open. |
+| Q12 | Distinct final output, rejected temp cleanup, cancellation retains original | Tested synthetic workflows: distinct finalized output, original SHA256 retained, cancelled during candidate encoding and rejected FFV1 search clean temporary directories. Crash cleanup exercise remains open. |
+| Q13 | Specific failures incl audio budget/lossless; no mathematical impossibility claim | Tested: actual >20MB noisy FFV1 fails supported same-codec search cleanly; no codec substitution; PCM budget failure and cancellation distinct. Disk/encoder failure integration remains open. |
 | Q14 | Visual development checks: HUD/foliage/particles/dark scenes/motion | Pending |
 
 ## 8. Clipboard and persistent interactive notifications
 | ID | Requirement | Status / evidence |
 |---|---|---|
 | I01 | Real CF_HDROP file clipboard, contention retries, file stays on disk | Partially tested: CF_HDROP and Preferred DropEffect are written; native Qt integration reads actual file data from clipboard. Contention and destination paste tests pending. |
-| I02 | Clipboard failure retains files, accurate message, Retry Copy, no success toast | Pending |
+| I02 | Clipboard failure retains files, accurate message, Retry Copy, no success toast | Implemented / untested failure branch: persisted copyPending/output identity, Retry Copy button, accurate terminal state; actual contention/failure tests remain open. |
 | I03 | Exact size/quality failure message, limiting reason in app; accurate other errors | Pending |
 | I04 | Successful copy exact deletion question with Yes/No; already-small no deletion | Pending |
 | I05 | Persisted job IDs resolve actions; body opens corresponding clip | Pending |

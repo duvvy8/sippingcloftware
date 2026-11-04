@@ -44,6 +44,14 @@ void selectValue(QComboBox *b, const QVariant &v) {
     if (index >= 0)
         b->setCurrentIndex(index);
 }
+QJsonObject captureSettings(const Settings &s) {
+    auto result = s.json();
+    for (const auto &key : {"library", "container", "folders", "startup", "autoRecord", "notifications",
+                            "overlayHotkey", "recordHotkey", "pttHotkey"})
+        result.remove(key);
+    result["window"] = qint64(s.window);
+    return result;
+}
 } // namespace
 void applyAppearance(QApplication &app) {
     QString interFamily;
@@ -160,7 +168,10 @@ MainWindow::MainWindow() : exports_(&recorder_.buffer(), this), library_(this), 
     connect(&exports_, &ExportQueue::jobChanged, this, [this](const QString &id) {
         updateJobs();
         for (const auto &job : exports_.jobs())
-            if (job.id == id && job.terminal && job.state == "Complete" && !completedSeen_.contains(id)) {
+            if (job.id == id && job.terminal &&
+                (job.state == "Complete" || job.state == "Already within limit" ||
+                 job.state == "Compressed but clipboard copy failed") &&
+                !completedSeen_.contains(id)) {
                 completedSeen_.insert(id);
                 if (recorder_.active())
                     libraryRefreshPending_ = true;
@@ -172,7 +183,12 @@ MainWindow::MainWindow() : exports_(&recorder_.buffer(), this), library_(this), 
     timer_.start(500);
     populateEncoders();
     refreshSources();
+    connect(display_, &QComboBox::currentIndexChanged, this, &MainWindow::updateCaptureChoices);
+    connect(source_, &QComboBox::currentIndexChanged, this, &MainWindow::updateCaptureChoices);
+    connect(windows_, &QComboBox::currentIndexChanged, this, &MainWindow::updateCaptureChoices);
+    updateCaptureChoices();
     refreshLibrary();
+    updateJobs();
     if (settings_.autoRecord)
         QTimer::singleShot(0, this, &MainWindow::toggleRecording);
 }
@@ -265,6 +281,20 @@ QWidget *MainWindow::clipsPage() {
     button("Crop / Aspect Ratio", editing, [this] { showEditor(1); });
     button("Audio", editing, [this] { showEditor(2); });
     r->addLayout(editing);
+    button("SDR Sharing Copy", r, [this] { showEditor(0, true); });
+    button("Auto Compress", r, [this] {
+        if (selectedPath_.isEmpty())
+            return;
+        try {
+            auto info = inspect(selectedPath_);
+            QString encoder = registry_.forCodec(info.codecId, {}, info.hdr);
+            if (encoder.isEmpty() && info.bytes > SizeLimit)
+                throw std::runtime_error("Test an implementation of this clip's codec before compression");
+            exports_.submitCompression(selectedPath_, encoder);
+        } catch (const std::exception &e) {
+            showError(QString::fromUtf8(e.what()));
+        }
+    });
     r->addStretch();
     split->addWidget(right);
     split->setSizes({760, 320});
@@ -278,6 +308,18 @@ QWidget *MainWindow::clipsPage() {
         auto *item = jobs_->currentItem();
         if (item)
             exports_.cancel(item->data(Qt::UserRole).toString());
+    });
+    button("Retry Copy", v, [this] {
+        auto *item = jobs_->currentItem();
+        if (!item)
+            return;
+        try {
+            QString error;
+            if (!exports_.retryCopy(item->data(Qt::UserRole).toString(), &error))
+                showError(error);
+        } catch (const std::exception &e) {
+            showError(QString::fromUtf8(e.what()));
+        }
     });
     connect(search_, &QLineEdit::textChanged, this, &MainWindow::fillLibrary);
     connect(applicationFilter_, &QComboBox::currentTextChanged, this, &MainWindow::fillLibrary);
@@ -414,12 +456,14 @@ QWidget *MainWindow::recordingPage() {
             a.name = d.name;
             a.kind = d.input ? "microphone" : "system";
         }
+        settings_.audio = readRecording().audio;
         settings_.audio << a;
         refreshSources();
     });
     button("Remove selected source", audioActions, [this] {
         int row = audio_->currentRow();
         if (row >= 0 && row < settings_.audio.size()) {
+            settings_.audio = readRecording().audio;
             settings_.audio.removeAt(row);
             refreshSources();
         }
@@ -589,8 +633,77 @@ void MainWindow::populateEncoders() {
     encoder_->addItem("Automatic · calibrated H.264", "auto");
     for (auto &c : registry_.encoders)
         addChoice(encoder_, c.name + " · " + c.codec + " · " + (c.encoded ? "tested" : c.reason), c.name,
-                  c.encoded, c.reason);
+                  c.encoded && c.replaySuitable(),
+                  c.replaySuitable() ? c.reason : "Export only: unsuitable replay stream");
     selectValue(encoder_, selected);
+    updateCaptureChoices();
+}
+void MainWindow::updateCaptureChoices() {
+    if (!hdr_)
+        return;
+    int index = display_->currentData().toInt();
+    const bool window = source_->currentData().toString() == "window";
+    if (window) {
+        auto monitor =
+            MonitorFromWindow(HWND(quintptr(windows_->currentData().toULongLong())), MONITOR_DEFAULTTONULL);
+        for (int i = 0; i < registry_.displays.size(); ++i)
+            if (registry_.displays[i].handle == quintptr(monitor)) {
+                index = i;
+                selectValue(display_, i);
+                break;
+            }
+    }
+    display_->setEnabled(!window);
+    if (index < 0 || index >= registry_.displays.size())
+        return;
+    const auto &display = registry_.displays[index];
+    bool verifiedHdr = false;
+    for (const auto &encoder : registry_.encoders)
+        verifiedHdr |= encoder.hdr;
+    hdr_->setEnabled(display.hdr && verifiedHdr);
+    hdr_->setToolTip(!display.hdr   ? "Selected display is currently SDR"
+                     : !verifiedHdr ? "No encoder has passed a high-bit-depth encode/decode test"
+                                    : "Preserves float capture through 10-bit BT.2020/PQ encoding");
+    if (auto *model = qobject_cast<QStandardItemModel *>(backend_->model())) {
+        auto *item = model->item(backend_->findData("dxgi"));
+        if (item) {
+            item->setEnabled(!window && !display.hdr);
+            item->setToolTip(window        ? "DXGI captures displays only"
+                             : display.hdr ? "HDR displays require floating-point WGC"
+                                           : "SDR monitor fallback");
+        }
+    }
+    if (display.refresh > 0 && recordFps_->findData(int(display.refresh)) < 0)
+        recordFps_->addItem(QString("Source · %1 fps").arg(display.refresh), int(display.refresh));
+    if (auto *model = qobject_cast<QStandardItemModel *>(recordFps_->model()))
+        for (int row = 0; row < recordFps_->count(); ++row) {
+            bool enabled = recordFps_->itemData(row).toInt() <= display.refresh;
+            model->item(row)->setEnabled(enabled);
+            model->item(row)->setToolTip(enabled ? QString()
+                                                 : "This frame rate exceeds the selected source rate");
+        }
+    if (auto *model = qobject_cast<QStandardItemModel *>(recordHeight_->model()))
+        for (int row = 0; row < recordHeight_->count(); ++row) {
+            bool enabled = recordHeight_->itemData(row).toInt() <= display.height;
+            model->item(row)->setEnabled(enabled);
+            model->item(row)->setToolTip(enabled ? QString()
+                                                 : "This resolution exceeds the selected display source");
+        }
+}
+bool MainWindow::approveSdrRecording(Settings &s) {
+    if (s.monitor < 0 || s.monitor >= registry_.displays.size())
+        return true;
+    if (registry_.displays[s.monitor].hdr && !s.hdr && !s.toneMapCapture) {
+        if (QMessageBox::question(this, "Record an SDR conversion?",
+                                  "The selected display is HDR. SDR recording requires tone mapping. Approve "
+                                  "SDR recording, or choose No and enable Preserve HDR?",
+                                  QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+            return false;
+        s.toneMapCapture = true;
+        settings_.toneMapCapture = true;
+        settings_.save();
+    }
+    return true;
 }
 void MainWindow::refreshSources() {
     auto previous = windows_->currentData();
@@ -656,7 +769,11 @@ Settings MainWindow::readRecording() const {
 void MainWindow::applyRecording() {
     auto next = readRecording();
     bool wasActive = recorder_.active();
-    if (wasActive && next.json() != settings_.json()) {
+    auto resolved = next;
+    if (resolved.encoder == "auto")
+        resolved.encoder = recorded_.encoder;
+    bool restart = wasActive && captureSettings(resolved) != captureSettings(recorded_);
+    if (restart) {
         if (QMessageBox::question(
                 this, "Restart capture?",
                 "Applying these settings stops capture and clears the replay buffer. Continue?",
@@ -670,8 +787,10 @@ void MainWindow::applyRecording() {
         return;
     }
     status_->setText("Recording settings applied");
-    if (wasActive)
+    if (restart) {
+        resetApproved_ = true;
         toggleRecording();
+    }
 }
 void MainWindow::toggleRecording() {
     if (recorder_.active()) {
@@ -681,8 +800,11 @@ void MainWindow::toggleRecording() {
     }
     try {
         auto s = readRecording();
+        const bool approved = std::exchange(resetApproved_, false);
+        if (!approveSdrRecording(s))
+            return;
         if (s.encoder == "auto") {
-            s.encoder = registry_.automatic();
+            s.encoder = registry_.automatic(s.hdr);
             if (s.encoder.isEmpty())
                 throw std::runtime_error("Run Test Encoders and Calibrate Capture before automatic "
                                          "recording, or choose a tested encoder explicitly.");
@@ -715,6 +837,13 @@ void MainWindow::toggleRecording() {
             throw std::runtime_error("Recording resolution cannot exceed the selected source");
         if (s.fps > display.refresh)
             throw std::runtime_error("Recording frame rate cannot exceed the source rate");
+        if (!approved && recorder_.buffer().count() > 0 && captureSettings(s) != captureSettings(recorded_)) {
+            if (QMessageBox::question(
+                    this, "Reset replay buffer?",
+                    "Starting with these recording settings clears the previous replay buffer. Continue?",
+                    QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+                return;
+        }
         settings_ = readRecording();
         if (!settings_.save())
             throw std::runtime_error("Cannot persist recording settings");
@@ -767,22 +896,24 @@ void MainWindow::calibrate() {
         return;
     }
     Settings selected = readRecording();
+    if (!approveSdrRecording(selected))
+        return;
     for (const auto &job : exports_.jobs())
         if (!job.terminal) {
             showError(
                 "Wait for pending exports before capture calibration so the measurement is representative.");
             return;
         }
-    if (selected.hdr) {
-        showError("HDR calibration requires the HDR pipeline");
-        return;
-    }
     QStringList choices;
     if (selected.encoder != "auto")
         choices << selected.encoder;
     else
         for (auto &c : registry_.encoders)
-            if (c.encoded && c.codecId == AV_CODEC_ID_H264 && (c.hardware || c.name == "libx264"))
+            if (c.encoded &&
+                (selected.hdr ? (c.hdr && (c.codecId == AV_CODEC_ID_HEVC || c.codecId == AV_CODEC_ID_AV1 ||
+                                           c.codecId == AV_CODEC_ID_H264))
+                              : (c.codecId == AV_CODEC_ID_H264)) &&
+                (c.hardware || c.name == "libx264" || c.name == "libx265" || c.name == "libsvtav1"))
                 choices << c.name;
     if (choices.isEmpty()) {
         showError("Run encoder tests first");
@@ -814,9 +945,17 @@ void MainWindow::calibrate() {
                 recorder.stop();
                 auto stats = recorder.stats();
                 result["stats"] = stats.json();
+                const auto segments = recorder.buffer().segments();
+                bool decoded = !segments.isEmpty();
+                for (const auto &segment : segments)
+                    if (!decodeValidate(segment.path, &cancelDiscovery_)) {
+                        decoded = false;
+                        break;
+                    }
+                result["captureSegmentsDecoded"] = decoded;
                 bool verified = stats.error.isEmpty() &&
                                 stats.encoded >= quint64(qMax(1., (stats.elapsed - .2) * stats.fps * .95)) &&
-                                stats.dropped == 0 && stats.backlog < 4;
+                                stats.dropped == 0 && stats.backlog < 4 && decoded;
                 result["passed"] = verified;
                 for (auto &c : registry.encoders)
                     if (c.name == name) {
@@ -956,10 +1095,17 @@ void MainWindow::selectClip() {
     library_.requestThumbnail(selectedPath_);
 }
 void MainWindow::updateJobs() {
+    QString selected = jobs_->currentItem() ? jobs_->currentItem()->data(Qt::UserRole).toString() : QString();
     jobs_->clear();
     for (auto &j : exports_.jobs()) {
-        auto *item = new QListWidgetItem(j.created + ' ' + j.state + " · " + j.message, jobs_);
+        auto *item = new QListWidgetItem(
+            j.created + ' ' + j.state + " · " +
+                (j.terminal ? QString() : QString::number(qRound(j.progress * 100)) + "% · ") + j.message,
+            jobs_);
         item->setData(Qt::UserRole, j.id);
+        item->setToolTip(j.message);
+        if (j.id == selected)
+            jobs_->setCurrentItem(item);
     }
 }
 void MainWindow::updateStatus() {
@@ -1042,21 +1188,29 @@ void MainWindow::openClip(const QString &path) {
     selectedPath_ = path;
     refreshLibrary();
 }
-void MainWindow::showEditor(int tab) {
+void MainWindow::showEditor(int tab, bool sdr) {
     if (selectedPath_.isEmpty())
         return;
     try {
         auto info = inspect(selectedPath_);
-        auto encoder = registry_.forCodec(info.codecId);
+        if (sdr && !info.hdr)
+            throw std::runtime_error("This clip is already SDR; no tone-mapped copy is needed");
+        auto encoder =
+            sdr ? registry_.forCodec(AV_CODEC_ID_H264) : registry_.forCodec(info.codecId, {}, info.hdr);
         if (encoder.isEmpty())
             throw std::runtime_error(
                 "Run encoder tests to select a verified implementation of this clip's codec");
         auto *dialog = new EditorDialog(selectedPath_, encoder, tab, this);
+        dialog->setSdrCopy(sdr);
         const auto original = selectedPath_;
         connect(dialog, &EditorDialog::exportRequested, this,
                 [this, original, encoder](const EditRequest &request) {
                     try {
-                        exports_.submitEdit(original, request, encoder, "High");
+                        auto chosen = request.sdr ? registry_.forCodec(AV_CODEC_ID_H264) : encoder;
+                        if (chosen.isEmpty())
+                            throw std::runtime_error(
+                                "No verified H.264 encoder is available for SDR sharing");
+                        exports_.submitEdit(original, request, chosen, "High");
                     } catch (const std::exception &e) {
                         showError(QString::fromUtf8(e.what()));
                     }
@@ -1110,6 +1264,9 @@ ClipToolbar::ClipToolbar(MainWindow *owner)
     available_->setWordWrap(true);
     available_->setFont(mono());
     v->addWidget(available_);
+    compress_ = button("Auto Compress", v, [this] { submit(true); });
+    compress_->setToolTip(
+        "Save and validate the original, then attempt a same-codec copy within 20 MB and the quality guard");
     save_ = button("Save Clip", v, [this] { submit(); });
     button("Show Folder", v,
            [this] { QDesktopServices::openUrl(QUrl::fromLocalFile(owner_->settings_.library)); });
@@ -1240,13 +1397,15 @@ void ClipToolbar::open() {
     encoder_->clear();
     for (auto &cap : owner_->registry_.encoders)
         if (cap.encoded)
-            addChoice(encoder_, cap.codec + " · " + cap.name, cap.name);
+            addChoice(encoder_, cap.codec + " · " + cap.name, cap.name, !recorded_.hdr || cap.hdr,
+                      "No verified high-bit-depth HDR output for this implementation");
     selectValue(encoder_, recorded_.encoder);
     selectValue(container_, recorded_.container);
     available_->setText(QString("Available: %1\nThis clip: %2")
                             .arg(durationText(pin_.duration()))
                             .arg(durationText(qMin(30., pin_.duration()))));
     save_->setEnabled(!pin_.id.isEmpty());
+    compress_->setEnabled(!pin_.id.isEmpty());
     save_->setToolTip(pin_.id.isEmpty() ? "Start recording and buffer footage before saving"
                                         : "Save the selected footage ending when this toolbar opened");
     auto screen = QGuiApplication::screenAt(QCursor::pos());
@@ -1276,11 +1435,13 @@ void ClipToolbar::open() {
     activateWindow();
     save_->setFocus();
 }
-void ClipToolbar::submit() {
+void ClipToolbar::submit(bool compress) {
     if (pin_.id.isEmpty())
         return;
     try {
         Settings output = recorded_;
+        output.library = owner_->settings_.library;
+        output.folderOverrides = owner_->settings_.folderOverrides;
         output.container = container_->currentData().toString();
         output.fps = fps_->currentData().toInt();
         output.height = resolution_->currentData().toInt();
@@ -1289,7 +1450,7 @@ void ClipToolbar::submit() {
         auto source = pin_;
         source.requested = duration_->currentData().toInt();
         source.start = qMax(source.start, source.end - source.requested);
-        owner_->exports_.submitSave(source, output, application_.name, application_.executable);
+        owner_->exports_.submitSave(source, output, application_.name, application_.executable, compress);
         pin_ = {};
         hide();
         owner_->status_->setText("Clip queued with fixed endpoint · " + durationText(source.duration()));

@@ -36,7 +36,7 @@ class EditorDialog : public QDialog {
     MediaInfo info_;
     QDoubleSpinBox *start_, *end_;
     QComboBox *mode_, *aspect_;
-    QCheckBox *crop_, *fit_, *mix_;
+    QCheckBox *crop_, *fit_, *mix_, *sdr_;
     QLabel *result_;
     CropPreview *preview_;
     QSpinBox *x_, *y_, *w_, *h_;
@@ -50,6 +50,9 @@ class EditorDialog : public QDialog {
   public:
     EditorDialog(const QString &, const QString &encoder, int initialTab, QWidget *parent = nullptr);
     ~EditorDialog();
+    void setSdrCopy(bool enabled) {
+        sdr_->setChecked(enabled);
+    }
   signals:
     void exportRequested(clip::EditRequest request);
 };

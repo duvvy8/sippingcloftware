@@ -32,11 +32,13 @@ class ExportQueue : public QObject {
     explicit ExportQueue(ReplayBuffer *, QObject *parent = nullptr, QString storage = {});
     ~ExportQueue();
     QString submitSave(const Interval &, const Settings &, const QString &application,
-                       const QString &executable);
+                       const QString &executable, bool compress = false);
+    QString submitCompression(const QString &original, const QString &encoder);
     QString submitEdit(const QString &original, const EditRequest &, const QString &encoder,
                        const QString &quality);
     QList<ExportJob> jobs() const;
     void cancel(const QString &);
+    bool retryCopy(const QString &, QString *error = nullptr);
     void shutdown();
   signals:
     void jobChanged(QString id);

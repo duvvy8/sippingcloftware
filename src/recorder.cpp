@@ -1,4 +1,7 @@
 #include "recorder.h"
+#include "hdr.h"
+#include "edit.h"
+#include "replay_storage.h"
 #include <winrt/base.h>
 namespace clip {
 namespace {
@@ -20,6 +23,8 @@ struct SegmentWriter {
     QString path;
     int frames = 0, fps = 60, w = 0, h = 0;
     bool finalized = false;
+    qint64 packetBytes = 0;
+    std::function<void(qint64)> reserve;
     ~SegmentWriter() {
         if (scale)
             sws_freeContext(scale);
@@ -52,9 +57,9 @@ struct SegmentWriter {
         c->max_b_frames = 0;
         c->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         c->pix_fmt = pixelFormat;
-        c->color_primaries = AVCOL_PRI_BT709;
-        c->color_trc = AVCOL_TRC_BT709;
-        c->colorspace = AVCOL_SPC_BT709;
+        c->color_primaries = s.hdr ? AVCOL_PRI_BT2020 : AVCOL_PRI_BT709;
+        c->color_trc = s.hdr ? AVCOL_TRC_SMPTE2084 : AVCOL_TRC_BT709;
+        c->colorspace = s.hdr ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709;
         c->color_range = AVCOL_RANGE_MPEG;
         configureEncoder(c, s.quality);
         check(avcodec_open2(c, codec, nullptr), "Open recording encoder");
@@ -96,6 +101,9 @@ struct SegmentWriter {
         std::unique_ptr<AVPacket, void (*)(AVPacket *)> owned(p, [](auto *v) { av_packet_free(&v); });
         int r;
         while ((r = avcodec_receive_packet(c, p)) >= 0) {
+            packetBytes += p->size;
+            if (reserve)
+                reserve(packetBytes + 2 * 1024 * 1024);
             av_packet_rescale_ts(p, c->time_base, s->time_base);
             p->stream_index = s->index;
             check(av_interleaved_write_frame(format, p), "Write replay packet");
@@ -105,8 +113,6 @@ struct SegmentWriter {
             check(r, "Receive encoded replay packet");
     }
     void addVideo(const CapturedFrame &source) {
-        if (source.floating)
-            throw std::runtime_error("HDR float conversion is not yet configured");
         auto f = av_frame_alloc();
         std::unique_ptr<AVFrame, void (*)(AVFrame *)> owned(f, [](auto *p) { av_frame_free(&p); });
         f->width = w;
@@ -118,15 +124,20 @@ struct SegmentWriter {
         f->colorspace = video->colorspace;
         f->color_range = video->color_range;
         check(av_frame_get_buffer(f, 32), "Allocate recording frame");
-        scale = sws_getCachedContext(scale, source.width, source.height, AV_PIX_FMT_BGRA, w, h,
-                                     video->pix_fmt, SWS_BICUBIC, nullptr, nullptr, nullptr);
-        if (!scale)
-            throw std::runtime_error("Unsupported capture conversion");
-        const uint8_t *src[] = {reinterpret_cast<const uint8_t *>(source.pixels.constData())};
-        int stride[] = {source.stride};
-        const int *coeff = sws_getCoefficients(SWS_CS_ITU709);
-        sws_setColorspaceDetails(scale, coeff, 1, coeff, 0, 0, 1 << 16, 1 << 16);
-        check(sws_scale(scale, src, stride, 0, source.height, f->data, f->linesize), "Convert capture frame");
+        if (source.floating)
+            convertFloatFrame(source, f, video->color_trc == AVCOL_TRC_SMPTE2084);
+        else {
+            scale = sws_getCachedContext(scale, source.width, source.height, AV_PIX_FMT_BGRA, w, h,
+                                         video->pix_fmt, SWS_BICUBIC, nullptr, nullptr, nullptr);
+            if (!scale)
+                throw std::runtime_error("Unsupported capture conversion");
+            const uint8_t *src[] = {reinterpret_cast<const uint8_t *>(source.pixels.constData())};
+            int stride[] = {source.stride};
+            const int *coeff = sws_getCoefficients(SWS_CS_ITU709);
+            sws_setColorspaceDetails(scale, coeff, 1, coeff, 0, 0, 1 << 16, 1 << 16);
+            check(sws_scale(scale, src, stride, 0, source.height, f->data, f->linesize),
+                  "Convert capture frame");
+        }
         check(avcodec_send_frame(video.get(), f), "Encode capture frame");
         packets(video.get(), videoStream);
     }
@@ -222,6 +233,7 @@ void Recorder::start(const Settings &s, const Registry &r) {
         initialized_ = false;
     }
     stop_ = false;
+    stopAt_ = 0;
     active_ = true;
     worker_ = std::thread([this, s, r] { run(s, r); });
     std::unique_lock lock(mutex_);
@@ -239,6 +251,7 @@ void Recorder::start(const Settings &s, const Registry &r) {
     }
 }
 void Recorder::stop() {
+    stopAt_ = clockSeconds();
     stop_ = true;
     if (worker_.joinable())
         worker_.join();
@@ -249,6 +262,7 @@ void Recorder::run(Settings s, Registry registry) {
     CaptureQueue queue;
     std::thread capture;
     AudioEngine audio;
+    ReplayStorage storage;
     std::unique_ptr<SegmentWriter> writer;
     double segmentStart = 0;
     auto commit = [&] {
@@ -257,17 +271,18 @@ void Recorder::run(Settings s, Registry registry) {
             writer->finish();
             buffer_.add({writer->path, segmentStart, segmentStart + double(count) / s.fps,
                          QFileInfo(writer->path).size()});
+            storage.committed(buffer_.segments());
             writer.reset();
         }
     };
     try {
         if (s.fps < 1 || s.fps > 240)
             throw std::runtime_error("Invalid recording frame rate");
-        if (s.hdr)
-            throw std::runtime_error("HDR recording path is not yet available");
         const auto *cap = registry.find(s.encoder);
-        if (!cap || !cap->encoded)
+        if (!cap || !cap->encoded || !cap->replaySuitable())
             throw std::runtime_error("Encoder has not passed an initialization and packet-output test");
+        if (s.hdr && !cap->hdr)
+            throw std::runtime_error("Selected encoder has not passed a 10-bit HDR encode and decode test");
         if (!cap->containers.contains("mkv"))
             throw std::runtime_error("Encoder cannot use independent replay segments in Matroska");
         if (s.monitor < 0 || s.monitor >= registry.displays.size())
@@ -275,8 +290,8 @@ void Recorder::run(Settings s, Registry registry) {
         if (s.fps > registry.displays[s.monitor].refresh + 0.1)
             throw std::runtime_error("Recording frame rate exceeds selected display source rate");
         QDir().mkpath(s.bufferFolder);
-        QStorageInfo storage(s.bufferFolder);
-        if (storage.bytesAvailable() < 128LL * 1024 * 1024)
+        QStorageInfo initialDisk(s.bufferFolder);
+        if (initialDisk.bytesAvailable() < 128LL * 1024 * 1024)
             throw std::runtime_error("Insufficient replay storage: at least 128 MiB free is required");
         audio.start(s.audio);
         capture = std::thread([&] {
@@ -341,6 +356,7 @@ void Recorder::run(Settings s, Registry registry) {
         double epoch = clockSeconds();
         segmentStart = epoch;
         buffer_.begin(epoch, s.retention, s.bufferBytes);
+        storage.begin(s.bufferFolder, storageToken_);
         qint64 totalFrames = 0, totalSamples = 0;
         {
             std::lock_guard lock(mutex_);
@@ -353,13 +369,15 @@ void Recorder::run(Settings s, Registry registry) {
             initialized_ = true;
             ready_.notify_all();
         }
-        while (!stop_) {
+        while (true) {
             double target = epoch + double(totalFrames) / s.fps;
-            if (clockSeconds() < target + 0.10) {
+            if (stop_ && target >= stopAt_.load())
+                break;
+            if (clockSeconds() < target + 0.05) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
-            double lag = clockSeconds() - target - 0.1;
+            double lag = clockSeconds() - target - 0.05;
             if (lag > 2.)
                 throw std::runtime_error("Encoder backlog exceeded two seconds. Recording stopped; lower "
                                          "resolution, frame rate, or encoder cost after reviewing settings.");
@@ -380,13 +398,22 @@ void Recorder::run(Settings s, Registry registry) {
                     throw std::runtime_error(
                         "Replay disk is nearly full. Recording stopped; completed clips were preserved.");
                 writer = std::make_unique<SegmentWriter>();
+                writer->reserve = [this](qint64 bytes) { buffer_.reserve(bytes); };
+                buffer_.reserve(2 * 1024 * 1024);
                 segmentStart = target;
-                auto pixelFormat = av_get_pix_fmt(
-                    cap->tested.first().toObject()["pixelFormat"].toString().toUtf8().constData());
-                writer->open(
-                    QDir(s.bufferFolder)
-                        .filePath(QUuid::createUuid().toString(QUuid::WithoutBraces) + ".mkv.partial"),
-                    s, w, h, audio.tracks(), pixelFormat);
+                AVPixelFormat pixelFormat = AV_PIX_FMT_NONE;
+                for (auto value : cap->tested) {
+                    auto test = value.toObject();
+                    if (test["hdr"].toBool() == s.hdr && test.contains("pixelFormat") &&
+                        test["encoded"].toBool()) {
+                        pixelFormat = av_get_pix_fmt(test["pixelFormat"].toString().toUtf8().constData());
+                        break;
+                    }
+                }
+                if (pixelFormat == AV_PIX_FMT_NONE)
+                    throw std::runtime_error("No verified pixel format matches the selected colour mode");
+                writer->open(storage.reserve(), s, w, h, audio.tracks(), pixelFormat);
+                storage.identifyActive();
             }
             writer->addVideo(current);
             qint64 nextSamples = qRound64(double(totalFrames + 1) * 48000 / s.fps);
@@ -427,6 +454,13 @@ void Recorder::run(Settings s, Registry registry) {
     if (capture.joinable())
         capture.join();
     audio.stop();
+    writer.reset();
+    try {
+        buffer_.reserve(0);
+    } catch (const std::exception &e) {
+        qWarning("Replay reservation release: %s", e.what());
+    }
+    storage.stop();
     buffer_.stop();
     {
         std::lock_guard lock(mutex_);
@@ -479,18 +513,7 @@ QString saveInterval(const Interval &interval, const Settings &s, const QString 
         filters << QString("fps=%1").arg(s.fps);
     if (!filters.isEmpty())
         args << "-vf" << filters.join(',');
-    if (encoder.contains("libx264") || encoder.contains("libx265"))
-        args << "-preset" << "fast" << "-crf"
-             << QString::number(s.quality == "Maximum"    ? 16
-                                : s.quality == "High"     ? 20
-                                : s.quality == "Balanced" ? 24
-                                                          : 28);
-    else if (encoder.contains("nvenc"))
-        args << "-preset" << "p5" << "-cq"
-             << QString::number(s.quality == "Maximum"    ? 16
-                                : s.quality == "High"     ? 20
-                                : s.quality == "Balanced" ? 24
-                                                          : 28);
+    args << encoderArguments(encoder, s.quality) << colorArguments(info);
     args << "-f" << (s.container == "mkv" ? "matroska" : s.container) << partial;
     auto result = runProcess(ffmpegPath(), args, 0, cancel);
     if (result.code != 0) {
@@ -503,6 +526,15 @@ QString saveInterval(const Interval &interval, const Settings &s, const QString 
         throw std::runtime_error("Saved original failed complete decoding validation");
     }
     auto saved = inspect(partial);
+    if (info.hdrMetadata != saved.hdrMetadata) {
+        QFile::remove(partial);
+        throw std::runtime_error("Saved clip lost available HDR metadata");
+    }
+    if (info.hdr && (!saved.hdr || saved.primaries != info.primaries || saved.transfer != info.transfer ||
+                     saved.matrix != info.matrix)) {
+        QFile::remove(partial);
+        throw std::runtime_error("Saved clip did not preserve HDR colour properties");
+    }
     if (std::abs(saved.duration - interval.duration()) >
         1. / qMax(1., saved.fps) + saved.audioRounding + 0.001) {
         QFile::remove(partial);

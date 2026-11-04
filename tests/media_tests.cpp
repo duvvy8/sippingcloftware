@@ -1,5 +1,6 @@
 #include "edit.h"
 #include "jobs.h"
+#include "hdr.h"
 #include <QtTest>
 #include <cmath>
 class MediaTests : public QObject {
@@ -199,6 +200,66 @@ class MediaTests : public QObject {
         buffer.stop();
         buffer.clear();
         QCOMPARE(digest(original_), digest_);
+    }
+    void hdrPreservationAndExplicitSdr() {
+        auto hdr = directory_.filePath("hdr.mkv");
+        auto generated = clip::runProcess(
+            clip::ffmpegPath(),
+            {"-v",
+             "error",
+             "-y",
+             "-i",
+             original_,
+             "-t",
+             "1",
+             "-map",
+             "0:v",
+             "-an",
+             "-vf",
+             "zscale=tin=709:min=709:pin=709:rin=limited:t=smpte2084:p=2020:m=2020_ncl:r=limited",
+             "-pix_fmt",
+             "yuv420p10le",
+             "-c:v",
+             "libx265",
+             "-preset",
+             "ultrafast",
+             "-x265-params",
+             "master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll="
+             "1000,400:repeat-headers=1:pools=1:frame-threads=1",
+             "-color_primaries",
+             "bt2020",
+             "-color_trc",
+             "smpte2084",
+             "-colorspace",
+             "bt2020nc",
+             "-color_range",
+             "tv",
+             hdr},
+            30000);
+        QVERIFY2(generated.code == 0, generated.output.constData());
+        auto source = clip::inspect(hdr);
+        QVERIFY(source.hdr);
+        QVERIFY(source.hdrMetadata.contains("mastering"));
+        QVERIFY(source.hdrMetadata.contains("light"));
+        auto savedDigest = digest(hdr);
+        clip::EditRequest request;
+        request.start = 0;
+        request.end = 1;
+        auto preserved =
+            clip::editMedia(hdr, directory_.filePath("preserved.mkv"), request, "libx265", "High");
+        QVERIFY(preserved.hdr);
+        QCOMPARE(preserved.primaries, source.primaries);
+        QCOMPARE(preserved.transfer, source.transfer);
+        QCOMPARE(preserved.hdrMetadata, source.hdrMetadata);
+        QVERIFY(preserved.pixelFormat.contains("10"));
+        request.sdr = true;
+        auto sdr = clip::editMedia(hdr, directory_.filePath("sdr.mp4"), request, "libx264", "High");
+        QVERIFY(!sdr.hdr);
+        QCOMPARE(sdr.primaries, QString("bt709"));
+        QCOMPARE(sdr.transfer, QString("bt709"));
+        QCOMPARE(sdr.matrix, QString("bt709"));
+        QVERIFY(sdr.hdrMetadata.isEmpty());
+        QCOMPARE(digest(hdr), savedDigest);
     }
 };
 QTEST_GUILESS_MAIN(MediaTests)

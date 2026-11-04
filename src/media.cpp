@@ -1,8 +1,70 @@
 #include "media.h"
+#include <vector>
+extern "C" {
+#include <libavutil/mastering_display_metadata.h>
+}
 namespace clip {
+static QJsonObject frameMetadata(const QString &path) {
+    AVFormatContext *f = nullptr;
+    if (avformat_open_input(&f, path.toUtf8().constData(), nullptr, nullptr) < 0)
+        return {};
+    std::unique_ptr<AVFormatContext, void (*)(AVFormatContext *)> format(
+        f, [](auto *p) { avformat_close_input(&p); });
+    if (avformat_find_stream_info(f, nullptr) < 0)
+        return {};
+    int stream = av_find_best_stream(f, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (stream < 0)
+        return {};
+    auto *decoder = avcodec_find_decoder(f->streams[stream]->codecpar->codec_id);
+    if (!decoder)
+        return {};
+    auto *c = avcodec_alloc_context3(decoder);
+    std::unique_ptr<AVCodecContext, void (*)(AVCodecContext *)> context(
+        c, [](auto *p) { avcodec_free_context(&p); });
+    avcodec_parameters_to_context(c, f->streams[stream]->codecpar);
+    c->thread_count = 2;
+    if (avcodec_open2(c, decoder, nullptr) < 0)
+        return {};
+    auto *packet = av_packet_alloc();
+    auto *frame = av_frame_alloc();
+    QJsonObject metadata;
+    for (int count = 0; count < 256 && av_read_frame(f, packet) >= 0; ++count) {
+        if (packet->stream_index == stream && avcodec_send_packet(c, packet) >= 0 &&
+            avcodec_receive_frame(c, frame) >= 0) {
+            if (auto *side = av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA)) {
+                const auto *m = reinterpret_cast<const AVMasteringDisplayMetadata *>(side->data);
+                QJsonObject value;
+                if (m->has_primaries) {
+                    QJsonArray primaries;
+                    for (int i = 0; i < 3; ++i)
+                        primaries << QJsonArray{av_q2d(m->display_primaries[i][0]),
+                                                av_q2d(m->display_primaries[i][1])};
+                    value["primaries"] = primaries;
+                    value["white"] = QJsonArray{av_q2d(m->white_point[0]), av_q2d(m->white_point[1])};
+                }
+                if (m->has_luminance) {
+                    value["minimum"] = av_q2d(m->min_luminance);
+                    value["maximum"] = av_q2d(m->max_luminance);
+                }
+                metadata["mastering"] = value;
+            }
+            if (auto *side = av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL)) {
+                const auto *m = reinterpret_cast<const AVContentLightMetadata *>(side->data);
+                metadata["light"] = QJsonObject{{"maxCLL", int(m->MaxCLL)}, {"maxFALL", int(m->MaxFALL)}};
+            }
+            av_packet_unref(packet);
+            break;
+        }
+        av_packet_unref(packet);
+    }
+    av_packet_free(&packet);
+    av_frame_free(&frame);
+    return metadata;
+}
 QJsonObject MediaInfo::json() const {
     return {{"duration", duration},
             {"fps", fps},
+            {"displayAspect", displayAspect},
             {"width", width},
             {"height", height},
             {"codec", codec},
@@ -10,12 +72,15 @@ QJsonObject MediaInfo::json() const {
             {"pixelFormat", pixelFormat},
             {"audioTracks", audioTracks},
             {"audioBytes", audioBytes},
+            {"audioPayloadHashes", QJsonArray::fromStringList(audioPayloadHashes)},
             {"bytes", bytes},
             {"hdr", hdr},
             {"transfer", transfer},
             {"primaries", primaries},
             {"matrix", matrix},
-            {"range", range}};
+            {"range", range},
+            {"hdrMetadata", hdrMetadata},
+            {"audioStreams", audioStreams}};
 }
 MediaInfo inspect(const QString &path, bool countAudio) {
     AVFormatContext *raw = nullptr;
@@ -31,6 +96,15 @@ MediaInfo inspect(const QString &path, bool countAudio) {
         auto s = raw->streams[i];
         auto p = s->codecpar;
         if (p->codec_type == AVMEDIA_TYPE_AUDIO) {
+            char layout[128]{};
+            av_channel_layout_describe(&p->ch_layout, layout, sizeof(layout));
+            auto *title = av_dict_get(s->metadata, "title", nullptr, 0);
+            m.audioStreams.append(QJsonObject{{"codec", avcodec_get_name(p->codec_id)},
+                                              {"channels", p->ch_layout.nb_channels},
+                                              {"layout", QString::fromUtf8(layout)},
+                                              {"rate", p->sample_rate},
+                                              {"title", title ? QString::fromUtf8(title->value)
+                                                              : QString("Track %1").arg(m.audioTracks + 1)}});
             ++m.audioTracks;
             if (p->sample_rate > 0)
                 m.audioRounding = qMax(m.audioRounding, double(p->frame_size) / p->sample_rate);
@@ -39,6 +113,9 @@ MediaInfo inspect(const QString &path, bool countAudio) {
             m.videoStream = int(i);
             m.width = p->width;
             m.height = p->height;
+            auto aspect = av_guess_sample_aspect_ratio(raw, s, nullptr);
+            m.displayAspect = double(m.width) / qMax(1, m.height) *
+                              (aspect.num > 0 && aspect.den > 0 ? av_q2d(aspect) : 1.);
             m.codecId = p->codec_id;
             m.codec = avcodec_get_name(p->codec_id);
             m.fps = av_q2d(av_guess_frame_rate(raw, s, nullptr));
@@ -57,14 +134,24 @@ MediaInfo inspect(const QString &path, bool countAudio) {
     }
     if (m.videoStream < 0)
         throw std::runtime_error("No video stream");
+    m.hdrMetadata = frameMetadata(path);
     if (countAudio) {
+        std::vector<std::unique_ptr<QCryptographicHash>> hashes;
+        for (unsigned i = 0; i < raw->nb_streams; ++i)
+            hashes.push_back(std::make_unique<QCryptographicHash>(QCryptographicHash::Sha256));
         auto pkt = av_packet_alloc();
         while (av_read_frame(raw, pkt) >= 0) {
-            if (raw->streams[pkt->stream_index]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+            if (raw->streams[pkt->stream_index]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
                 m.audioBytes += pkt->size;
+                hashes[size_t(pkt->stream_index)]->addData(
+                    QByteArrayView(reinterpret_cast<const char *>(pkt->data), pkt->size));
+            }
             av_packet_unref(pkt);
         }
         av_packet_free(&pkt);
+        for (unsigned i = 0; i < raw->nb_streams; ++i)
+            if (raw->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+                m.audioPayloadHashes << QString::fromLatin1(hashes[i]->result().toHex());
     }
     return m;
 }

@@ -77,6 +77,9 @@ QString Capture::backend() const {
 }
 void Capture::open(const Settings &s, const Registry &r) {
     close();
+    if (s.source == "window" && s.backend == "dxgi")
+        throw std::runtime_error(
+            "DXGI captures displays only. Select Windows Graphics Capture for a window source.");
     if (r.displays.isEmpty())
         throw std::runtime_error("No attached capture display");
     int index = qBound(0, s.monitor, int(r.displays.size()) - 1);
@@ -88,10 +91,13 @@ void Capture::open(const Settings &s, const Registry &r) {
                 display = d;
     }
     auto &p = *impl_;
-    p.floating = s.hdr;
+    p.floating = display.hdr || s.hdr;
     p.interval = 1. / qMax(1, s.fps);
     if (s.hdr && !display.hdr)
         throw std::runtime_error("Selected display does not currently report HDR output");
+    if (display.hdr && !s.hdr && !s.toneMapCapture)
+        throw std::runtime_error(
+            "This display is HDR. Enable Preserve HDR or explicitly approve tone-mapped SDR recording.");
     ComPtr<IDXGIFactory1> factory;
     check_hresult(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
     ComPtr<IDXGIAdapter1> adapter;
@@ -123,19 +129,21 @@ void Capture::open(const Settings &s, const Registry &r) {
             p.rtDevice = inspectable.as<IDirect3DDevice>();
             p.pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
                 p.rtDevice,
-                s.hdr ? DirectXPixelFormat::R16G16B16A16Float : DirectXPixelFormat::B8G8R8A8UIntNormalized, 3,
-                size);
+                p.floating ? DirectXPixelFormat::R16G16B16A16Float
+                           : DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                3, size);
             p.session = p.pool.CreateCaptureSession(p.item);
             p.item.Closed([ptr = &p](auto &&, auto &&) { ptr->closed = true; });
             p.session.StartCapture();
             p.backend = "Windows Graphics Capture";
             return;
         } catch (...) {
-            if (s.source == "window" || s.hdr)
+            if (s.source == "window" || p.floating)
                 throw; /* Explicitly reported monitor fallback; settings unchanged. */
         }
-    if (s.hdr)
-        throw std::runtime_error("HDR requires Windows Graphics Capture; DXGI fallback is SDR only");
+    if (p.floating)
+        throw std::runtime_error("An HDR display requires floating-point Windows Graphics Capture; DXGI "
+                                 "fallback cannot preserve or tone-map it");
     ComPtr<IDXGIOutput> o;
     check_hresult(adapter->EnumOutputs(UINT(display.output), &o));
     ComPtr<IDXGIOutput1> o1;

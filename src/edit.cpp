@@ -1,4 +1,5 @@
 #include "edit.h"
+#include "hdr.h"
 #include <cmath>
 namespace clip {
 QJsonObject EditRequest::json() const {
@@ -7,16 +8,13 @@ QJsonObject EditRequest::json() const {
         t << i;
     for (auto v : gains)
         g << v;
-    return {{"start", start},
-            {"end", end},
-            {"fast", fast},
-            {"crop", crop},
-            {"fit", fit},
-            {"mixAudio", mixAudio},
-            {"region", QJsonArray{region.x(), region.y(), region.width(), region.height()}},
-            {"aspect", aspect},
-            {"tracks", t},
-            {"gains", g}};
+    return {
+        {"start", start},   {"end", end},
+        {"fast", fast},     {"crop", crop},
+        {"fit", fit},       {"mixAudio", mixAudio},
+        {"sdr", sdr},       {"region", QJsonArray{region.x(), region.y(), region.width(), region.height()}},
+        {"aspect", aspect}, {"tracks", t},
+        {"gains", g}};
 }
 EditRequest EditRequest::fromJson(const QJsonObject &o) {
     EditRequest r;
@@ -26,6 +24,7 @@ EditRequest EditRequest::fromJson(const QJsonObject &o) {
     r.crop = o["crop"].toBool();
     r.fit = o["fit"].toBool(true);
     r.mixAudio = o["mixAudio"].toBool();
+    r.sdr = o["sdr"].toBool();
     r.aspect = o["aspect"].toString("Source");
     auto a = o["region"].toArray();
     if (a.size() == 4)
@@ -247,12 +246,12 @@ MediaInfo editMedia(const QString &source, const QString &output, const EditRequ
     const auto original = inspect(source);
     auto bounds = trimBounds(source, r.start, r.end, r.fast);
     const auto *codec = avcodec_find_encoder_by_name(encoder.toUtf8().constData());
-    if (!r.fast && (!codec || codec->id != original.codecId))
+    if (!r.fast && (!codec || (!r.sdr && codec->id != original.codecId)))
         throw std::runtime_error("Editing requires a verified implementation of the source codec");
     bool audioChanged = r.mixAudio || r.tracks.size() != original.audioTracks;
     for (auto gain : r.gains)
         audioChanged |= std::abs(gain - 1.) > 1e-9;
-    if (r.fast && (r.crop || r.aspect != "Source" || audioChanged))
+    if (r.fast && (r.crop || r.aspect != "Source" || audioChanged || r.sdr))
         throw std::runtime_error(
             "Fast packet-copy trim cannot also crop or change audio. Choose Exact trim.");
     QString ext = QFileInfo(output).suffix().toLower();
@@ -275,6 +274,11 @@ MediaInfo editMedia(const QString &source, const QString &output, const EditRequ
     } else {
         args << encoderArguments(encoder, quality);
         QStringList filters;
+        if (r.sdr) {
+            if (!original.hdr)
+                throw std::runtime_error("Source is already SDR; no HDR conversion is needed");
+            filters << sdrToneMapFilter();
+        }
         if (r.crop) {
             QRect region = r.region;
             region.setX(region.x() & ~1);
@@ -335,9 +339,7 @@ MediaInfo editMedia(const QString &source, const QString &output, const EditRequ
             args << "-c:a" << (ext == "webm" ? "libopus" : ext == "mkv" ? "flac" : "aac");
         } else
             args << "-an";
-        if (original.hdr)
-            args << "-color_primaries" << original.primaries << "-color_trc" << original.transfer
-                 << "-colorspace" << original.matrix << "-color_range" << QString::number(original.range);
+        args << colorArguments(original, r.sdr);
     }
     args << "-map_metadata" << "0" << "-f" << format << partial;
     if (r.fast)
@@ -354,11 +356,18 @@ MediaInfo editMedia(const QString &source, const QString &output, const EditRequ
     double tolerance = 1. / qMax(1., edited.fps) + edited.audioRounding + 0.001;
     if (std::abs(edited.duration - (bounds.end - bounds.start)) > tolerance)
         throw std::runtime_error("Edited file duration did not match the disclosed trim boundaries");
-    if (edited.codecId != original.codecId)
+    if (!r.sdr && edited.codecId != original.codecId)
         throw std::runtime_error("Edited file codec changed unexpectedly");
-    if (original.hdr &&
+    if (!r.sdr && original.hdr &&
         (!edited.hdr || edited.primaries != original.primaries || edited.transfer != original.transfer))
         throw std::runtime_error("HDR colour properties were not preserved");
+    if (!r.sdr && original.hdrMetadata != edited.hdrMetadata)
+        throw std::runtime_error("Available HDR mastering or light-level metadata was not preserved");
+    if (r.sdr && !edited.hdrMetadata.isEmpty())
+        throw std::runtime_error("SDR output still contains HDR mastering metadata");
+    if (r.sdr &&
+        (edited.hdr || edited.primaries != "bt709" || edited.transfer != "bt709" || edited.matrix != "bt709"))
+        throw std::runtime_error("SDR sharing copy failed colour conversion validation");
     if (!QFile::rename(partial, output))
         throw std::runtime_error("Cannot finalize edited output");
     return edited;

@@ -35,7 +35,8 @@ struct ProcessResult {
     bool cancelled = false, timedOut = false;
 };
 ProcessResult runProcess(const QString &program, const QStringList &args, int timeoutMs = 0,
-                         std::atomic_bool *cancel = nullptr, std::function<void(QByteArray)> output = {});
+                         std::atomic_bool *cancel = nullptr, std::function<void(QByteArray)> output = {},
+                         const QString &workingDirectory = {});
 struct AudioSource {
     QString id, name, kind = "system";
     quint32 pid = 0;
@@ -51,7 +52,7 @@ struct Settings {
     int monitor = 0, fps = 60, height = 0, retention = 300;
     quintptr window = 0;
     qint64 bufferBytes = 4LL * 1024 * 1024 * 1024;
-    bool hdr = false, startup = false, autoRecord = false, notifications = true;
+    bool hdr = false, toneMapCapture = false, startup = false, autoRecord = false, notifications = true;
     QString overlayHotkey = "Ctrl+Shift+S", recordHotkey = "Ctrl+Shift+R", pttHotkey = "V";
     QList<AudioSource> audio;
     QMap<QString, QString> folderOverrides;

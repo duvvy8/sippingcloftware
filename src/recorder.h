@@ -17,6 +17,8 @@ class Recorder {
     ReplayBuffer buffer_;
     std::thread worker_;
     std::atomic_bool stop_ = false, active_ = false;
+    std::atomic<double> stopAt_ = 0;
+    QString storageToken_ = QUuid::createUuid().toString(QUuid::WithoutBraces);
     mutable std::mutex mutex_;
     RecordingStats stats_;
     std::condition_variable ready_;

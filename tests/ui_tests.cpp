@@ -41,6 +41,7 @@ class UiTests : public QObject {
         window_->toolbar_->open();
         QVERIFY(window_->toolbar_->isVisible());
         QVERIFY(!window_->toolbar_->save_->isEnabled());
+        QVERIFY(!window_->toolbar_->compress_->isEnabled());
         QTest::keyClick(window_->toolbar_, Qt::Key_Escape);
         QVERIFY(!window_->toolbar_->isVisible());
         QCOMPARE(window_->toolbar_->pin_.id, QString());
@@ -146,6 +147,22 @@ class UiTests : public QObject {
         QCOMPARE(edited.height, 180);
         QVERIFY(std::abs(edited.duration - 1.) < .06);
         QVERIFY(QFileInfo::exists(sample_));
+    }
+    void libraryCompressionAction() {
+        window_->selectedPath_ = sample_;
+        QPushButton *compress = nullptr;
+        for (auto *button : window_->tabs_->widget(0)->findChildren<QPushButton *>())
+            if (button->text() == "Auto Compress")
+                compress = button;
+        QVERIFY(compress);
+        QTest::mouseClick(compress, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(window_->exports_.jobs().last().kind == "compress" &&
+                                     window_->exports_.jobs().last().terminal,
+                                 15000);
+        const auto job = window_->exports_.jobs().last();
+        QCOMPARE(job.state, QString("Already within limit"));
+        QCOMPARE(job.output, sample_);
+        QVERIFY(job.details["copied"].toBool());
     }
     void externalRenameRecovery() {
         auto original = fileIdentity(sample_);

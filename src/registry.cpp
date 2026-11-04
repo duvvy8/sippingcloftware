@@ -3,6 +3,7 @@
 #include <wrl/client.h>
 extern "C" {
 #include <libavcodec/codec_desc.h>
+#include <libavutil/cpu.h>
 }
 using Microsoft::WRL::ComPtr;
 namespace clip {
@@ -17,6 +18,11 @@ QJsonObject Adapter::json() const {
 QJsonObject Display::json() const {
     return {{"name", name},     {"width", width},     {"height", height}, {"adapter", adapter},
             {"output", output}, {"refresh", refresh}, {"hdr", hdr}};
+}
+bool EncoderCaps::replaySuitable() const {
+    static const QStringList raw{"avrp", "avui", "bitpacked", "r10k", "r210", "v210", "y41p", "yuv4", "vbn"};
+    return avcodec_find_decoder(AVCodecID(codecId)) && !raw.contains(name) &&
+           !description.contains("uncompressed", Qt::CaseInsensitive);
 }
 QJsonObject EncoderCaps::json() const {
     return {{"name", name},
@@ -34,6 +40,9 @@ QJsonObject EncoderCaps::json() const {
             {"hardwareMatched", hardwareMatched},
             {"initialized", initialized},
             {"encoded", encoded},
+            {"replaySuitable", replaySuitable()},
+            {"appropriateForLive", replaySuitable() && live},
+            {"appropriateForExport", encoded},
             {"live", live},
             {"hdr", hdr},
             {"elapsedMs", elapsedMs}};
@@ -67,6 +76,11 @@ static bool imageCodec(const AVCodec *c) {
     // muxers can technically store an image sequence. Intra-only *video* remains.
     const auto *d = avcodec_descriptor_get(c->id);
     if (!d)
+        return true;
+    static const QStringList images{"alias_pix", "dpx",     "exr",  "fits",   "hdr",  "jpegls", "ljpeg",
+                                    "pbm",       "pfm",     "pgm",  "pgmyuv", "phm",  "ppm",    "qoi",
+                                    "sgi",       "sunrast", "wbmp", "xface",  "vnull"};
+    if (images.contains(QString::fromUtf8(c->name)))
         return true;
     return (d->props & AV_CODEC_PROP_TEXT_SUB) || d->mime_types != nullptr || c->id == AV_CODEC_ID_GIF ||
            c->id == AV_CODEC_ID_APNG || c->id == AV_CODEC_ID_RAWVIDEO || c->id == AV_CODEC_ID_WRAPPED_AVFRAME;
@@ -186,10 +200,14 @@ void Registry::discover() {
 }
 QString Registry::cacheKey() const {
     QJsonArray a;
-    for (const auto &g : adapters)
-        a << g.json();
+    for (const auto &g : adapters) {
+        auto identity = g.json();
+        identity.remove("luid"); // Boot-local identifiers do not invalidate unchanged driver tests.
+        a << identity;
+    }
     QByteArray bytes = QJsonDocument(a).toJson(QJsonDocument::Compact) + QByteArray(av_version_info()) +
-                       avcodec_configuration() + qVersion() + "probe-v3";
+                       avcodec_configuration() + qVersion() + QByteArray::number(av_get_cpu_flags()) +
+                       "probe-v5-replay-classification";
     return QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex();
 }
 void Registry::probe(std::function<void(QString)> progress, std::atomic_bool *cancel, bool useCache) {
@@ -233,6 +251,21 @@ void Registry::probe(std::function<void(QString)> progress, std::atomic_bool *ca
         if (e.encoded) {
             e.tested.append(o);
             e.reason = "Synthetic SDR encode verified; capture calibration required for live recommendation";
+            bool deep = false;
+            for (const auto &name : e.pixelFormats) {
+                auto *desc = av_pix_fmt_desc_get(av_get_pix_fmt(name.toUtf8().constData()));
+                if (desc && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL) && desc->comp[0].depth >= 10)
+                    deep = true;
+            }
+            if (deep && !(cancel && cancel->load())) {
+                runProcess(QCoreApplication::applicationFilePath(),
+                           {"--probe", e.name, "--hdr", "--result", result}, 20000, cancel);
+                auto hdr = readJson(result);
+                QFile::remove(result);
+                e.hdr = hdr["encoded"].toBool() && hdr["decodedDepth"].toInt() >= 10;
+                if (e.hdr)
+                    e.tested.append(hdr);
+            }
         }
     }
     QJsonArray a;
@@ -289,6 +322,11 @@ QJsonObject Registry::testEncoder(const QString &name, bool hdr) {
             }
         if (c->pix_fmt == AV_PIX_FMT_NONE)
             c->pix_fmt = AV_PIX_FMT_YUV420P;
+        if (hdr) {
+            auto *desc = av_pix_fmt_desc_get(c->pix_fmt);
+            if (!desc || desc->comp[0].depth < 10)
+                throw std::runtime_error("No suitable high-bit-depth input format");
+        }
         c->color_primaries = hdr ? AVCOL_PRI_BT2020 : AVCOL_PRI_BT709;
         c->color_trc = hdr ? AVCOL_TRC_SMPTE2084 : AVCOL_TRC_BT709;
         c->colorspace = hdr ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709;
@@ -297,6 +335,23 @@ QJsonObject Registry::testEncoder(const QString &name, bool hdr) {
         check(avcodec_open2(c, codec, nullptr), "Initialize encoder");
         result["initialized"] = true;
         result["pixelFormat"] = QString(av_get_pix_fmt_name(c->pix_fmt));
+        const auto *decoder = hdr ? avcodec_find_decoder(codec->id) : nullptr;
+        std::unique_ptr<AVCodecContext, void (*)(AVCodecContext *)> decodedContext(
+            nullptr, [](auto *p) { avcodec_free_context(&p); });
+        std::unique_ptr<AVFrame, void (*)(AVFrame *)> decodedFrame(nullptr,
+                                                                   [](auto *p) { av_frame_free(&p); });
+        if (hdr) {
+            if (!decoder)
+                throw std::runtime_error("No decoder to verify HDR bit depth");
+            decodedContext.reset(avcodec_alloc_context3(decoder));
+            decodedFrame.reset(av_frame_alloc());
+            auto *params = avcodec_parameters_alloc();
+            check(avcodec_parameters_from_context(params, c), "HDR test decoder parameters");
+            check(avcodec_parameters_to_context(decodedContext.get(), params), "HDR test decoder context");
+            avcodec_parameters_free(&params);
+            decodedContext->thread_count = 2;
+            check(avcodec_open2(decodedContext.get(), decoder, nullptr), "Open HDR verification decoder");
+        }
         auto frame = av_frame_alloc();
         auto packet = av_packet_alloc();
         std::unique_ptr<AVFrame, void (*)(AVFrame *)> fr(frame, [](auto *p) { av_frame_free(&p); });
@@ -315,6 +370,15 @@ QJsonObject Registry::testEncoder(const QString &name, bool hdr) {
             while ((r = avcodec_receive_packet(c, packet)) >= 0) {
                 if (packet->size > 0)
                     ++packets;
+                if (hdr) {
+                    check(avcodec_send_packet(decodedContext.get(), packet), "Decode HDR test packet");
+                    while (avcodec_receive_frame(decodedContext.get(), decodedFrame.get()) >= 0) {
+                        auto *desc = av_pix_fmt_desc_get(AVPixelFormat(decodedFrame->format));
+                        if (desc)
+                            result["decodedDepth"] = desc->comp[0].depth;
+                        av_frame_unref(decodedFrame.get());
+                    }
+                }
                 av_packet_unref(packet);
             }
             if (r != AVERROR(EAGAIN) && r != AVERROR_EOF)
@@ -322,9 +386,10 @@ QJsonObject Registry::testEncoder(const QString &name, bool hdr) {
         };
         for (int i = 0; i < 12; ++i) {
             check(av_frame_make_writable(frame), "Writable frame");
-            for (int p = 0; p < AV_NUM_DATA_POINTERS; ++p)
-                if (frame->buf[p])
-                    memset(frame->buf[p]->data, 16 + i * 7, frame->buf[p]->size);
+            ptrdiff_t lines[4] = {frame->linesize[0], frame->linesize[1], frame->linesize[2],
+                                  frame->linesize[3]};
+            check(av_image_fill_black(frame->data, lines, c->pix_fmt, AVCOL_RANGE_MPEG, c->width, c->height),
+                  "Fill synthetic frame");
             frame->pts = i;
             check(avcodec_send_frame(c, frame), "Send test frame");
             receive();
@@ -332,7 +397,16 @@ QJsonObject Registry::testEncoder(const QString &name, bool hdr) {
         check(avcodec_send_frame(c, nullptr), "Flush test frames");
         receive();
         result["packets"] = packets;
-        result["encoded"] = packets > 0;
+        if (hdr) {
+            check(avcodec_send_packet(decodedContext.get(), nullptr), "Flush HDR test decoder");
+            while (avcodec_receive_frame(decodedContext.get(), decodedFrame.get()) >= 0) {
+                auto *desc = av_pix_fmt_desc_get(AVPixelFormat(decodedFrame->format));
+                if (desc)
+                    result["decodedDepth"] = desc->comp[0].depth;
+                av_frame_unref(decodedFrame.get());
+            }
+        }
+        result["encoded"] = packets > 0 && (!hdr || result["decodedDepth"].toInt() >= 10);
         result["reason"] =
             packets > 0 ? "Encoded and flushed synthetic frames" : "Encoder produced no packets";
     } catch (const std::exception &e) {
@@ -347,7 +421,17 @@ const EncoderCaps *Registry::find(const QString &n) const {
             return &e;
     return nullptr;
 }
-QString Registry::automatic() const {
+QString Registry::automatic(bool hdr) const {
+    if (hdr) {
+        for (int codec : {AV_CODEC_ID_HEVC, AV_CODEC_ID_AV1, AV_CODEC_ID_H264})
+            for (const auto &e : encoders)
+                if (e.codecId == codec && e.encoded && e.hdr && e.live && e.hardware)
+                    return e.name;
+        for (const auto &e : encoders)
+            if (e.encoded && e.hdr && e.live)
+                return e.name;
+        return {};
+    }
     if (auto *e = find(recommended); e && e->encoded && e->live && e->codecId == AV_CODEC_ID_H264)
         return recommended;
     for (const auto &e : encoders)
@@ -358,14 +442,14 @@ QString Registry::automatic() const {
             return e.name;
     return {};
 }
-QString Registry::forCodec(int id, const QString &preferred) const {
-    if (auto e = find(preferred); e && e->codecId == id && e->encoded)
+QString Registry::forCodec(int id, const QString &preferred, bool hdr) const {
+    if (auto e = find(preferred); e && e->codecId == id && e->encoded && (!hdr || e->hdr))
         return e->name;
     for (const auto &e : encoders)
-        if (e.codecId == id && e.encoded && !e.hardware)
+        if (e.codecId == id && e.encoded && !e.hardware && (!hdr || e.hdr))
             return e.name;
     for (const auto &e : encoders)
-        if (e.codecId == id && e.encoded)
+        if (e.codecId == id && e.encoded && (!hdr || e.hdr))
             return e.name;
     return {};
 }

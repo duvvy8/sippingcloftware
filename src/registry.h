@@ -23,6 +23,7 @@ struct EncoderCaps {
     bool included = true, hardware = false, hardwareMatched = false, initialized = false, encoded = false,
          live = false, hdr = false;
     double elapsedMs = 0;
+    bool replaySuitable() const;
     QJsonObject json() const;
     static EncoderCaps fromJson(const QJsonObject &);
 };
@@ -36,9 +37,9 @@ class Registry {
     void probe(std::function<void(QString)> progress = {}, std::atomic_bool *cancel = nullptr,
                bool useCache = true);
     QString cacheKey() const;
-    QString automatic() const;
+    QString automatic(bool hdr = false) const;
     const EncoderCaps *find(const QString &) const;
-    QString forCodec(int codecId, const QString &preferred = {}) const;
+    QString forCodec(int codecId, const QString &preferred = {}, bool hdr = false) const;
     QJsonObject json() const;
     static QJsonObject testEncoder(const QString &name, bool hdr = false);
 };
