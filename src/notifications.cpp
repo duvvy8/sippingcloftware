@@ -21,8 +21,34 @@ NotificationAction parseNotificationAction(const QString &text) {
     result.job = items[0].second;
     result.action = items[1].second;
     result.valid = uuid.match(result.job).hasMatch() &&
-                   QStringList{"open", "yes", "no", "retry"}.contains(result.action);
+                   QStringList{"open", "open-original", "yes", "no", "retry"}.contains(result.action);
     return result;
+}
+namespace {
+QString mediaSize(const QJsonObject &media) {
+    return QString::number(double(media["bytes"].toInteger()) / 1000000., 'f', 2) + " MB";
+}
+QString mediaDetails(const QJsonObject &media) {
+    if (media["bytes"].toInteger() <= 0)
+        return {};
+    return QString("%1×%2 · %3 fps · %4 s")
+        .arg(media["width"].toInt())
+        .arg(media["height"].toInt())
+        .arg(media["fps"].toDouble(), 0, 'g', 4)
+        .arg(media["duration"].toDouble(), 0, 'f', 1);
+}
+QString toastVisual(const QString &arguments, const QString &title, const QString &body) {
+    return "<toast launch=\"" + arguments.toHtmlEscaped() +
+           "\"><visual><binding template=\"ToastGeneric\"><text>" + title.toHtmlEscaped() +
+           "</text><text>" + body.toHtmlEscaped() + "</text></binding></visual>";
+}
+}
+QString savedNotificationXml(const QString &id, const QJsonObject &media) {
+    const QString args = "job=" + id + "&action=open-original";
+    return parseNotificationAction(args).valid
+        ? toastVisual(args, "Clip Saved", mediaSize(media) + " · " + mediaDetails(media)) +
+            "<audio silent=\"true\"/></toast>"
+        : QString{};
 }
 QString notificationXml(const ExportJob &job) {
     QString arguments = "job=" + job.id + "&action=";
@@ -32,22 +58,30 @@ QString notificationXml(const ExportJob &job) {
     bool question = compressed && job.state == "Complete" && job.details["copied"].toBool() &&
                     !job.details["alreadySmall"].toBool() &&
                     job.details["deleteDecision"].toString() == "Pending";
+    const auto media = job.details["outputMedia"].toObject();
+    const auto details = mediaDetails(media);
+    QString title = "Auto Compress";
     QString text;
-    if (question)
-        text = "File compressed and copied to clipboard. Delete unreduced file?";
-    else if (job.state == "Cannot meet constraints")
+    if (question) {
+        title = details.isEmpty() ? "Clip Compressed" : "Compressed to " + mediaSize(media);
+        text = "Copied to clipboard. Delete original?";
+        if (!details.isEmpty())
+            text += "\n" + details;
+    } else if (job.state == "Cannot meet constraints")
         text = "File was too big to reduce to 20MB.";
     else if (job.state == "Compressed but clipboard copy failed")
         text = "Compressed, but could not copy.";
-    else if (job.state == "Already within limit")
-        text = "File already meets the limit and was copied to clipboard.";
-    else if (job.state == "Complete")
-        text = job.kind == "edit" ? "Edited copy saved." : "Clip saved.";
-    else
+    else if (job.state == "Already within limit") {
+        title = "Clip Ready to Share";
+        text = "Already within 20 MB and copied to clipboard.";
+        if (!details.isEmpty())
+            text += "\n" + mediaSize(media) + " · " + details;
+    } else if (job.state == "Complete") {
+        title = job.kind == "edit" ? "Edited Clip Saved" : "Clip Saved";
+        text = job.message;
+    } else
         text = job.state + ". " + job.message;
-    QString xml = "<toast launch=\"" + (arguments + "open").toHtmlEscaped() +
-                  "\"><visual><binding template=\"ToastGeneric\"><text>" + text.toHtmlEscaped() +
-                  "</text></binding></visual>";
+    QString xml = toastVisual(arguments + "open", title, text);
     if (question || job.details["copyPending"].toBool()) {
         xml += "<actions>";
         auto action = [&](const QString &label, const QString &command) {
@@ -115,7 +149,10 @@ CLSID activatorClass() {
     return id;
 }
 QString shellLinkPath() {
-    return QStandardPaths::writableLocation(QStandardPaths::ApplicationsLocation) + "/Clips.lnk";
+    PWSTR programs = nullptr;
+    winrt::check_hresult(SHGetKnownFolderPath(FOLDERID_Programs, 0, nullptr, &programs));
+    const auto freePath = qScopeGuard([&] { CoTaskMemFree(programs); });
+    return QDir(QString::fromWCharArray(programs)).filePath(QString(AppName) + ".lnk");
 }
 QString shortcutTarget(const QString &path) {
     ComPtr<IShellLinkW> link;
@@ -123,6 +160,12 @@ QString shortcutTarget(const QString &path) {
         return {};
     ComPtr<IPersistFile> file;
     if (FAILED(link.As(&file)) || FAILED(file->Load(path.toStdWString().c_str(), STGM_READ)))
+        return {};
+    ComPtr<IPropertyStore> properties;
+    PROPVARIANT value{};
+    const auto clear = qScopeGuard([&] { PropVariantClear(&value); });
+    if (FAILED(link.As(&properties)) || FAILED(properties->GetValue(PKEY_AppUserModel_ID, &value)) ||
+        value.vt != VT_LPWSTR || !value.pwszVal || wcscmp(value.pwszVal, Notifications::AppId) != 0)
         return {};
     wchar_t target[32768]{};
     if (FAILED(link->GetPath(target, 32768, nullptr, SLGP_RAWPATH)))
@@ -163,15 +206,15 @@ Notifications::Notifications(QObject *parent) : QObject(parent), impl_(std::make
     winrt::check_hresult(SetCurrentProcessExplicitAppUserModelID(AppId));
 }
 Notifications::~Notifications() = default;
-bool Notifications::show(const ExportJob &job, QString *error, bool suppressPopup) {
+namespace {
+bool submitToast(const QString &xml, const QString &id, const wchar_t *group, QString *error, bool suppressPopup) {
     QString operation = "Constructing notification";
     try {
-        auto xml = notificationXml(job);
         if (xml.isEmpty())
             throw std::runtime_error("Job has no completed notification");
         using namespace winrt::Windows::UI::Notifications;
         operation = "Creating Windows toast notifier";
-        auto notifier = ToastNotificationManager::CreateToastNotifier(AppId);
+        auto notifier = ToastNotificationManager::CreateToastNotifier(Notifications::AppId);
         operation = "Reading Windows notification settings";
         try {
             if (notifier.Setting() != NotificationSetting::Enabled) {
@@ -191,8 +234,8 @@ bool Notifications::show(const ExportJob &job, QString *error, bool suppressPopu
         document.LoadXml(xml.toStdWString());
         ToastNotification toast(document);
         toast.SuppressPopup(suppressPopup);
-        toast.Tag(job.id.left(16).toStdWString());
-        toast.Group(L"exports");
+        toast.Tag(id.left(16).toStdWString());
+        toast.Group(group);
         operation = "Submitting Windows notification";
         notifier.Show(toast);
         return true;
@@ -205,6 +248,13 @@ bool Notifications::show(const ExportJob &job, QString *error, bool suppressPopu
             *error = QString::fromUtf8(e.what());
     }
     return false;
+}
+}
+bool Notifications::show(const ExportJob &job, QString *error, bool suppressPopup) {
+    return submitToast(notificationXml(job), job.id, L"exports", error, suppressPopup);
+}
+bool Notifications::showSaved(const QString &id, const QJsonObject &media, QString *error, bool suppressPopup) {
+    return submitToast(savedNotificationXml(id, media), id, L"saves", error, suppressPopup);
 }
 bool Notifications::registerShell(bool install, QString *error) {
     HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -238,9 +288,13 @@ bool Notifications::registerShell(bool install, QString *error) {
             }
             return registration.status() == QSettings::NoError;
         }
-        if (QFileInfo::exists(shortcut) &&
-            shortcutTarget(shortcut).compare(QFileInfo(exe).absoluteFilePath(), Qt::CaseInsensitive) != 0)
-            throw std::runtime_error("A different Clips shortcut already exists; it was preserved");
+        const auto target = shortcutTarget(shortcut);
+        if (QFileInfo::exists(shortcut) && target.isEmpty())
+            throw std::runtime_error("A different SippingCloftware shortcut already exists");
+        const QString command = '"' + QDir::toNativeSeparators(exe) + "\" --notification-server";
+        if (target.compare(QFileInfo(exe).absoluteFilePath(), Qt::CaseInsensitive) == 0 &&
+            registration.value(".").toString() == command && assets.value("OwnerExecutable") == exe)
+            return true;
         if (!QDir().mkpath(QFileInfo(shortcut).absolutePath()))
             throw std::runtime_error("Cannot create Start Menu folder");
         ComPtr<IShellLinkW> link;
@@ -263,9 +317,9 @@ bool Notifications::registerShell(bool install, QString *error) {
         ComPtr<IPersistFile> file;
         winrt::check_hresult(link.As(&file));
         winrt::check_hresult(file->Save(shortcut.toStdWString().c_str(), TRUE));
-        registration.setValue(".", '"' + QDir::toNativeSeparators(exe) + "\" --notification-server");
+        registration.setValue(".", command);
         registration.sync();
-        assets.setValue("DisplayName", "Clips");
+        assets.setValue("DisplayName", QString(AppName));
         assets.setValue("CustomActivator", QString::fromWCharArray(ClassId));
         assets.setValue("OwnerExecutable", exe);
         assets.sync();

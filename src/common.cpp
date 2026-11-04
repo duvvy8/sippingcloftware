@@ -25,6 +25,12 @@ double processCpuSeconds() {
     };
     return value(kernel) + value(user);
 }
+QString defaultClipLibrary() {
+    return QDir(QStandardPaths::writableLocation(QStandardPaths::MoviesLocation)).filePath(AppName);
+}
+QString legacyClipLibrary() {
+    return QDir(QStandardPaths::writableLocation(QStandardPaths::MoviesLocation)).filePath("Clips");
+}
 QString stateDir() {
     const auto override = qEnvironmentVariable("CLIPPER_STATE_DIR");
     if (!override.isEmpty()) {
@@ -150,7 +156,7 @@ AudioSource AudioSource::fromJson(const QJsonObject &o) {
     return a;
 }
 Settings::Settings() {
-    library = QStandardPaths::writableLocation(QStandardPaths::MoviesLocation) + "/Clips";
+    library = defaultClipLibrary();
     bufferFolder = stateDir() + "/buffer";
 }
 QJsonObject Settings::json() const {
@@ -179,7 +185,10 @@ QJsonObject Settings::json() const {
             {"hdr", hdr},
             {"toneMapCapture", toneMapCapture},
             {"startup", startup},
-            {"autoRecord", autoRecord},
+            {"recordOnLaunch", autoRecord},
+            {"borderlessDisplay", borderlessDisplay},
+            {"clipMic", clipMic},
+            {"clipDesktop", clipDesktop},
             {"notifications", notifications},
             {"overlayHotkey", overlayHotkey},
             {"recordHotkey", recordHotkey},
@@ -212,7 +221,10 @@ void Settings::loadObject(const QJsonObject &o) {
     hdr = o["hdr"].toBool();
     toneMapCapture = o["toneMapCapture"].toBool();
     startup = o["startup"].toBool();
-    autoRecord = o["autoRecord"].toBool();
+    autoRecord = o["recordOnLaunch"].toBool(true);
+    borderlessDisplay = o["borderlessDisplay"].toBool(true);
+    clipMic = o["clipMic"].toBool(true);
+    clipDesktop = o["clipDesktop"].toBool(true);
     notifications = o["notifications"].toBool(true);
     overlayHotkey = o["overlayHotkey"].toString(overlayHotkey);
     recordHotkey = o["recordHotkey"].toString(recordHotkey);
@@ -229,7 +241,8 @@ bool Settings::save() const {
 }
 QJsonObject captureSettings(const Settings &s) {
     auto result = s.json();
-    for (const auto &key : {"library", "container", "folders", "startup", "autoRecord", "notifications",
+    for (const auto &key : {"library", "container", "folders", "startup", "recordOnLaunch", "notifications",
+                            "clipMic", "clipDesktop",
                             "overlayHotkey", "recordHotkey", "pttHotkey"})
         result.remove(key);
     result["window"] = s.source == "window" ? qint64(s.window) : 0;

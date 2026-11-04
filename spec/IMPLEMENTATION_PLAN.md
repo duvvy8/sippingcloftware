@@ -4,15 +4,15 @@
 
 This document is the implementation specification for a future Codex `/goal` task. Writing or reading this file alone is not an instruction to start implementation. Start building only when the user explicitly invokes the implementation task.
 
-When authorised to implement, complete the scope below, verify the result, and report any material limitations honestly. Do not stop at a mockup or a scaffold. Do not assign a product name or add branding. Use Inter and Geist Mono throughout application-controlled interfaces.
+When authorised to implement, complete the scope below, verify the result, and report material limitations. Use the name SippingCloftware. Use Windows UI typography for the capture HUD and Inter and Geist Mono for the main window.
 
 Suggested goal text:
 
-> Implement the application described in IMPLEMENTATION_PLAN.md. Work through the complete specification, build and test the application, and produce a distributable Windows installer and verification report. Keep the application unnamed. Do not treat existing experimental starter files as an established architecture. Do not claim untested hardware paths are verified.
+> Implement the application described in IMPLEMENTATION_PLAN.md. Work through the complete specification, build and test SippingCloftware, and produce a distributable Windows installer and verification report. Report the hardware paths actually verified.
 
 ## 1. Objective and scope
 
-Build an unnamed Windows desktop application for recording gaming highlights and producing convenient, high-quality clips. It is intended for personal use by a small group of friends.
+SippingCloftware is a Windows tray application for recording gaming highlights and producing convenient, high-quality clips. It is intended for personal use by a small group of friends.
 
 Priorities, in order:
 
@@ -58,7 +58,7 @@ The first release should be substantial and usable, without requiring commercial
 - ARM64, macOS, and Linux releases.
 - Advanced compositing, effects, or a full video-editing timeline.
 
-Do not assign a product name, create branding, or add a logo. Default output location: `Videos\Clips`.
+Default output location is `Videos\Clips`.
 
 ## 2. Interface and interaction design
 
@@ -93,28 +93,19 @@ Provide three primary areas:
 | **Recording** | Configure the capture source, encoder, audio, buffer, and recording quality. |
 | **Settings** | Configure shortcuts, folders, startup behaviour, notifications, and advanced options. |
 
-The main window is not required to remain open while recording. Closing it hides the app to the tray; Exit explicitly stops recording and closes the process.
+Normal launch goes straight to the system tray. The tray icon opens the main window on demand. Closing the window returns to the tray. The tray menu includes clip toolbar, start or stop recording, and Exit actions. Exit stops recording and closes the process.
 
-Recording and automatic startup are off initially.
+Recording starts when SippingCloftware launches. Windows sign-in launch is opt-in in Settings. A first launch without a calibrated SDR profile can start a basic H.264 software profile at up to 720p and 30 FPS. A window source requires reselection after restart.
 
 ### Clipping toolbar
 
-Follow the supplied sketch: the game remains visible, with a narrow vertical toolbar near the left edge of the active game display. The sketch is a layout reference, not a requirement to reproduce hand-drawn shapes. The toolbar's controls and behaviour are specified here so the plan remains usable without the original attachment.
+Follow the supplied sketch as a narrow vertical counterpart to the Windows Snipping Tool toolbar. Show it near the active display's left edge on the hotkey. Apply a uniform translucent dim layer to that display while the toolbar is visible. Keep the HUD and dim layer out of replay capture. Suppress the dim layer on capture paths where exclusion cannot be verified.
 
-The toolbar appears only when its shortcut is pressed. Do not dim the whole game or show a full-screen opaque window.
+Use a native Windows backdrop brush under a translucent charcoal tint, clipped to the toolbar and the open menu, with a solid dark fallback. Slide the toolbar and adjoining menus in briefly, respecting Windows' animation preference. Dim the active display with a capture-excluded layer. Dismiss the toolbar and dim layer on Escape or switching to another app. Group the Save Clip and recording icons at the top. Show the current container, frame rate, resolution, quality and duration on the short strip.
 
-Arrange controls vertically:
+Click a current value to open its presets in a small adjacent stack. Click a preset to slide the group's single highlight to that button's actual bounds. The labels stay in place, and keyboard selection follows the same behavior. Keep secondary choices such as a custom duration and encoder settings in the advanced panel.
 
-1. Recording indicator and start/stop.
-2. Container.
-3. Frame rate.
-4. Resolution.
-5. Duration.
-6. **Auto Compress**.
-7. **Save Clip**.
-8. **Show Folder**.
-
-Use compact selectors with readable labels and tooltips. Expand detailed options into small adjacent panels rather than making the toolbar excessively wide.
+Place **Auto Compress** below duration. It starts off each time the toolbar opens. Put **Mic** and **Desktop Audio** below it, both on when the toolbar opens. Apply them to the saved clip using the replay's separate audio mixes. Capture continues using the configured audio sources.
 
 Provide:
 
@@ -125,7 +116,7 @@ Provide:
 - Quality: Maximum, High, Balanced, and Compact, with encoder-specific mappings.
 - An advanced panel for codec and encoder implementation.
 
-Escape dismisses the toolbar. Saving or submitting an Auto Compress job dismisses it immediately; processing continues in the background.
+Escape dismisses the toolbar and dim layer. Saving dismisses both immediately and processing continues in the background.
 
 ### Clip timing
 
@@ -164,7 +155,7 @@ Use:
 - CMake and MSVC.
 - Qt 6 Widgets.
 - Windows Graphics Capture and Direct3D 11.
-- DXGI Desktop Duplication as a monitor-capture fallback.
+- Prefer borderless DXGI Desktop Duplication for SDR display recording. Windows Graphics Capture remains available for window capture, HDR, and display fallback. Its recording border follows Windows' policy.
 - FFmpeg libraries for codec discovery, encoding, decoding, filtering, and muxing.
 - WASAPI for audio capture.
 - Windows clipboard, notification, and shell APIs.
@@ -380,7 +371,7 @@ Push-to-talk uses a separately configurable binding.
 
 ### User-facing contract
 
-Auto Compress is a **save-and-compress button** below duration.
+Auto Compress is a per-clip toggle below duration. With the toggle armed, Save Clip submits a save-and-compress job.
 
 It must:
 
@@ -390,9 +381,7 @@ It must:
 4. Keep the duration unchanged.
 5. Preserve the original unless the user explicitly chooses to delete it after success.
 
-Preserve the original codec, container, aspect ratio, colour characteristics, and intended audio tracks. A different implementation of the same codec is allowed.
-
-Do not silently switch from a lossless or specialist codec to H.264 or AV1 to force success.
+Save the original with the selected codec and container. Allow the separate share copy to change codec and container. Use verified H.264/MP4 for SDR first and AV1/WebM as a fallback. For HDR, use verified 10-bit HEVC/MP4 and preserve colour and HDR metadata. Maintain display aspect ratio.
 
 If the original already fits:
 
@@ -419,19 +408,11 @@ Calculate the available video budget from:
 
 Then divide by duration and multiply by eight to obtain the approximate video bitrate budget in bits per second.
 
-Copy compatible audio initially. Do not remove tracks, downmix channels, or shorten audio automatically. If retained audio makes the target impossible, fail cleanly.
+Try all audio tracks first. Copy compatible tracks and re-encode incompatible tracks with their original channel layouts. If the all-track search cannot produce a usable share copy, try the compatibility mix alone at 96 kb/s, using the default audio track if there is no labelled mix. Report the audio policy used in the output details.
 
 ### Candidate progression
 
-Use this order:
-
-| Stage | Behaviour |
-|---|---|
-| 1 | Keep source dimensions and frame rate; improve encoding efficiency and progressively increase compression strength. |
-| 2 | If the source exceeds 60 fps, test 60 fps at original dimensions. |
-| 3 | Keep that frame rate while testing applicable lower resolutions. |
-| 4 | If necessary, test 30, 24, 20, then 15 fps; reconsider resolution choices at each rate. |
-| 5 | Stop if no allowed candidate meets size and quality requirements. |
+For each codec and audio combination, sample the source dimensions and frame rate, the next lower step on each axis separately and together, and the allowed floor. Use the source value as the floor on an axis already below the limit. Try up to two full encodes in sample score order. Use two-pass bitrate targeting on verified encoders and at most one bitrate correction per encode if it overshoots.
 
 Resolution ladder, where lower than the source:
 
@@ -466,8 +447,7 @@ A candidate succeeds only when all checks pass:
 
 - At most 20,000,000 bytes.
 - Fully decodable.
-- Correct codec and container.
-- Intended audio tracks retained.
+- Codec, container, and audio match the selected share profile.
 - Correct colour characteristics.
 - Quality guard passed.
 - No intentional duration reduction.

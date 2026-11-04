@@ -1,5 +1,6 @@
 #pragma once
 #include "registry.h"
+#include "platform.h"
 #include <d3d11.h>
 #include <wrl/client.h>
 namespace clip {
@@ -8,6 +9,7 @@ struct CapturedFrame {
     int width = 0, height = 0, stride = 0;
     bool floating = false;
     double timestamp = 0;
+    ApplicationIdentity fullscreenApp;
 };
 class Capture {
     struct Impl;

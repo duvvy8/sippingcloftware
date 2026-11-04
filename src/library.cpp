@@ -2,6 +2,24 @@
 #include "platform.h"
 #include "replay_storage.h"
 namespace clip {
+namespace {
+QString metadataPath(const QString &root, const QJsonObject &identity) {
+    if (identity.isEmpty())
+        return {};
+    const auto key = identity["volume"].toString() + '-' + identity["file"].toString() + '-' +
+                     identity["created"].toString();
+    return QDir(root).filePath("Metadata/" + key + ".clip.json");
+}
+}
+QJsonObject readClipMetadata(const QString &root, const QString &path) {
+    const auto central = metadataPath(root, fileIdentity(path));
+    const auto metadata = central.isEmpty() ? QJsonObject{} : readJson(central);
+    return metadata.isEmpty() ? readJson(path + ".clip.json") : metadata;
+}
+bool writeClipMetadata(const QString &root, const QString &path, const QJsonObject &metadata) {
+    const auto central = metadataPath(root, fileIdentity(path));
+    return !central.isEmpty() && writeJson(central, metadata);
+}
 QJsonObject ClipRecord::json() const {
     return {{"path", path},       {"application", application},
             {"created", created}, {"relationship", relationship},
@@ -47,35 +65,40 @@ void Library::refresh(const QString &root) {
             auto r = ClipRecord::fromJson(v.toObject());
             byIdentity[r.identity["volume"].toString() + ":" + r.identity["file"].toString()] = r;
         }
-        QDirIterator it(root, {"*.mp4", "*.mkv", "*.webm", "*.mov"}, QDir::Files,
-                        QDirIterator::Subdirectories);
-        while (it.hasNext() && !cancel_) {
-            auto path = it.next();
-            if (readJson(QFileInfo(path).dir().filePath("session.json"))["owner"].toString() ==
-                ReplayStorage::Owner)
-                continue;
-            auto identity = fileIdentity(path);
-            auto key = identity["volume"].toString() + ":" + identity["file"].toString();
-            ClipRecord r;
-            if (byIdentity.contains(key) && byIdentity[key].identity == identity) {
-                r = byIdentity[key];
-                r.path = path;
-            } else
-                try {
-                    r.path = path;
-                    r.identity = identity;
-                    auto side = readJson(path + ".clip.json");
-                    r.media = inspect(path).json();
-                    r.application = side["application"].toString(QFileInfo(path).dir().dirName());
-                    r.created = side["created"].toString(
-                        QFileInfo(path).birthTime().toUTC().toString(Qt::ISODateWithMs));
-                    r.relationship = side["relationship"].toString("original");
-                    r.parent = side["parent"].toString();
-                    r.id = side["id"].toString();
-                } catch (const std::exception &) {
+        QStringList roots{root};
+        if (QDir(root) == QDir(defaultClipLibrary()))
+            roots.append(legacyClipLibrary());
+        for (const auto &folder : roots) {
+            QDirIterator it(folder, {"*.mp4", "*.mkv", "*.webm", "*.mov"}, QDir::Files,
+                            QDirIterator::Subdirectories);
+            while (it.hasNext() && !cancel_) {
+                auto path = it.next();
+                if (readJson(QFileInfo(path).dir().filePath("session.json"))["owner"].toString() ==
+                    ReplayStorage::Owner)
                     continue;
-                }
-            items << r;
+                auto identity = fileIdentity(path);
+                auto key = identity["volume"].toString() + ":" + identity["file"].toString();
+                ClipRecord r;
+                if (byIdentity.contains(key) && byIdentity[key].identity == identity) {
+                    r = byIdentity[key];
+                    r.path = path;
+                } else
+                    try {
+                        r.path = path;
+                        r.identity = identity;
+                        auto side = readClipMetadata(root, path);
+                        r.media = inspect(path).json();
+                        r.application = side["application"].toString(QFileInfo(path).dir().dirName());
+                        r.created = side["created"].toString(
+                            QFileInfo(path).birthTime().toUTC().toString(Qt::ISODateWithMs));
+                        r.relationship = side["relationship"].toString("original");
+                        r.parent = side["parent"].toString();
+                        r.id = side["id"].toString();
+                    } catch (const std::exception &) {
+                        continue;
+                    }
+                items << r;
+            }
         }
         if (cancel_)
             return;

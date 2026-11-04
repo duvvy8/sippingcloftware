@@ -22,7 +22,7 @@ class AudioEngine {
     void start(const QList<AudioSource> &);
     void stop();
     QList<std::vector<float>> read(double start, int frames);
-    int tracks() const;
+    QStringList trackRoles() const;
     QString error() const;
     QString notice() const;
     quint64 discontinuities() const;

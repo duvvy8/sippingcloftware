@@ -1,5 +1,6 @@
 #include "platform.h"
 #include <QKeySequence>
+#include <dwmapi.h>
 #include <powrprof.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -80,8 +81,26 @@ ApplicationIdentity windowApplication(quintptr value) {
     }
     return result;
 }
-ApplicationIdentity foregroundApplication() {
-    return windowApplication(quintptr(GetForegroundWindow()));
+HWND fullscreenCaptureWindow(HMONITOR monitor, HWND windowCapture) {
+    const auto window = windowCapture ? windowCapture : GetForegroundWindow();
+    if (!window || window == GetShellWindow() || !IsWindowVisible(window) || IsIconic(window) ||
+        MonitorFromWindow(window, MONITOR_DEFAULTTONULL) != monitor)
+        return nullptr;
+    const auto style = GetWindowLongPtrW(window, GWL_STYLE);
+    if (IsZoomed(window) && (style & WS_CAPTION) == WS_CAPTION)
+        return nullptr;
+    RECT bounds{};
+    if (FAILED(DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &bounds, sizeof(bounds))) &&
+        !GetWindowRect(window, &bounds))
+        return nullptr;
+    MONITORINFO display{sizeof(display)};
+    if (!GetMonitorInfoW(monitor, &display))
+        return nullptr;
+    const auto &screen = display.rcMonitor;
+    return bounds.left <= screen.left && bounds.top <= screen.top &&
+                   bounds.right >= screen.right && bounds.bottom >= screen.bottom
+               ? window
+               : nullptr;
 }
 QList<QPair<quintptr, QString>> captureWindows() {
     QList<QPair<quintptr, QString>> result;

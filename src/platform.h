@@ -10,8 +10,8 @@ struct ApplicationIdentity {
     quint32 pid = 0;
     quintptr window = 0;
 };
-ApplicationIdentity foregroundApplication();
 ApplicationIdentity windowApplication(quintptr);
+HWND fullscreenCaptureWindow(HMONITOR, HWND windowCapture = nullptr);
 QList<QPair<quintptr, QString>> captureWindows();
 bool copyFile(const QString &, QString *error = nullptr, int attempts = 8);
 void showInFolder(const QString &);

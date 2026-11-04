@@ -1,6 +1,7 @@
 #include "jobs.h"
 #include "platform.h"
 #include "compression.h"
+#include "library.h"
 #include "recycle.h"
 namespace clip {
 QJsonObject ExportJob::json() const {
@@ -65,7 +66,8 @@ ExportQueue::ExportQueue(ReplayBuffer *b, QObject *parent, QString storage)
             j.message =
                 "Interrupted by application shutdown or crash. Any finalized original has been retained.";
             j.terminal = true;
-            QFile::remove(j.original + ".partial");
+            if (!j.original.isEmpty())
+                QFile::remove(j.original + ".partial");
             writeJson(QDir(folder_).filePath(j.id + ".json"), j.json());
         }
         if (j.details["deleteDecision"].toString() == "Recycling") {
@@ -88,20 +90,13 @@ void ExportQueue::persistLocked() {
             throw std::runtime_error(
                 "Cannot persist export job. Check available disk space and folder access.");
 }
-QString ExportQueue::submitSave(const Interval &source, const Settings &s, const QString &app,
-                                const QString &exe, bool compress) {
+QString ExportQueue::submitSave(const Interval &source, const Settings &s, bool compress) {
     ExportJob j;
     j.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     j.source = source;
     j.kind = compress ? "save-compress" : "save";
     j.settings = s;
-    j.application = app;
-    j.executable = exe;
     j.created = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
-    QString root = s.folderOverrides.value(exe, QDir(s.library).filePath(safeName(app)));
-    j.original = uniquePath(
-        root, QDateTime::currentDateTime().toString("yyyy-MM-dd_HH-mm-ss-zzz") + '_' + j.id.left(8),
-        s.container);
     {
         std::lock_guard lock(mutex_);
         if (stopping_)
@@ -119,17 +114,18 @@ QString ExportQueue::submitSave(const Interval &source, const Settings &s, const
     emit jobChanged(j.id);
     return j.id;
 }
-QString ExportQueue::submitCompression(const QString &original, const QString &encoder) {
+QString ExportQueue::submitCompression(const QString &original, const QString &encoder, const QString &library) {
     ExportJob j;
     j.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     j.kind = "compress";
     j.original = original;
     j.settings.encoder = encoder;
+    j.settings.library = library.isEmpty() ? QFileInfo(original).absolutePath() : library;
     j.created = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
     j.details["sourceIdentity"] = fileIdentity(original);
     if (j.details["sourceIdentity"].toObject().isEmpty())
         throw std::runtime_error("Original is unavailable");
-    auto sidecar = readJson(original + ".clip.json");
+    auto sidecar = readClipMetadata(j.settings.library, original);
     j.application = sidecar["application"].toString(QFileInfo(original).dir().dirName());
     j.executable = sidecar["executable"].toString();
     {
@@ -153,13 +149,14 @@ QList<ExportJob> ExportQueue::jobs() const {
     return jobs_;
 }
 QString ExportQueue::submitEdit(const QString &original, const EditRequest &request, const QString &encoder,
-                                const QString &quality) {
+                                const QString &quality, const QString &library) {
     ExportJob job;
     job.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     job.kind = "edit";
     job.original = original;
     job.created = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
-    auto sidecar = readJson(original + ".clip.json");
+    job.settings.library = library.isEmpty() ? QFileInfo(original).absolutePath() : library;
+    auto sidecar = readClipMetadata(job.settings.library, original);
     job.application = sidecar["application"].toString(QFileInfo(original).dir().dirName());
     job.executable = sidecar["executable"].toString();
     job.settings.encoder = encoder;
@@ -423,7 +420,7 @@ void ExportQueue::run() {
                 if (fileIdentity(job.original) != job.details["sourceIdentity"].toObject())
                     throw std::runtime_error(
                         "Original changed while the edit was processing; output retained for inspection");
-                if (!writeJson(job.output + ".clip.json", {{"id", job.id},
+                if (!writeClipMetadata(job.settings.library, job.output, {{"id", job.id},
                                                            {"application", job.application},
                                                            {"executable", job.executable},
                                                            {"created", job.created},
@@ -449,11 +446,37 @@ void ExportQueue::run() {
                     if (s.end > resolved.start && s.start < resolved.end)
                         chosen << s;
                 resolved.segments = chosen;
+                QMap<QString, double> fullscreenSeconds;
+                QMap<QString, QString> appNames;
+                for (const auto &segment : resolved.segments)
+                    for (const auto &span : segment.fullscreen) {
+                        const double overlap = qMin(span.end, resolved.end) - qMax(span.start, resolved.start);
+                        if (overlap > 0 && !span.executable.isEmpty()) {
+                            fullscreenSeconds[span.executable] += overlap;
+                            appNames[span.executable] = span.application;
+                        }
+                    }
+                double longest = 0;
+                for (auto app = fullscreenSeconds.cbegin(); app != fullscreenSeconds.cend(); ++app)
+                    if (app.value() > longest) {
+                        longest = app.value();
+                        job.application = appNames.value(app.key());
+                        job.executable = app.key();
+                    }
+                const QString root = job.settings.folderOverrides.value(
+                    job.executable, QDir(job.settings.library).filePath(safeName(job.application)));
+                const auto time = QDateTime::fromString(job.created, Qt::ISODateWithMs).toLocalTime();
+                job.original = uniquePath(root, time.toString("yyyy-MM-dd_HH-mm-ss-zzz") + '_' + job.id.left(8),
+                                          job.settings.container);
                 {
                     std::lock_guard lock(mutex_);
                     for (auto &j : jobs_)
-                        if (j.id == job.id)
+                        if (j.id == job.id) {
                             j.source = resolved;
+                            j.application = job.application;
+                            j.executable = job.executable;
+                            j.original = job.original;
+                        }
                     persistLocked();
                 }
                 saveInterval(resolved, job.settings, job.original, &cancel_);
@@ -464,7 +487,7 @@ void ExportQueue::run() {
                                     {"created", job.created},
                                     {"relationship", "original"},
                                     {"media", info.json()}};
-                if (!writeJson(job.original + ".clip.json", sidecar))
+                if (!writeClipMetadata(job.settings.library, job.original, sidecar))
                     throw std::runtime_error("Clip saved, but metadata could not be written");
                 {
                     std::lock_guard lock(mutex_);
@@ -476,6 +499,7 @@ void ExportQueue::run() {
                 buffer_->release(job.source.id);
                 if (job.kind == "save")
                     update(job.id, "Complete", "Clip saved and completely decoded", true);
+                emit clipSaved(job.id, info.json());
             }
             if (job.kind == "compress" || job.kind == "save-compress") {
                 if (job.kind == "compress" &&
@@ -513,6 +537,7 @@ void ExportQueue::run() {
                             j.details["originalIdentity"] = originalIdentity;
                             j.details["attempts"] = result.attempts;
                             j.details["quality"] = result.quality.json();
+                            j.details["outputMedia"] = result.media.json();
                             j.details["limitingReason"] = result.reason;
                             j.details["alreadySmall"] = result.state == "Already within limit";
                             if (!result.output.isEmpty())
@@ -526,7 +551,7 @@ void ExportQueue::run() {
                 } else {
                     bool alreadySmall = result.state == "Already within limit";
                     if (!alreadySmall &&
-                        !writeJson(result.output + ".clip.json", {{"id", job.id},
+                        !writeClipMetadata(job.settings.library, result.output, {{"id", job.id},
                                                                   {"application", job.application},
                                                                   {"executable", job.executable},
                                                                   {"created", job.created},

@@ -237,3 +237,63 @@ Additional compression tests pass for synthetic HDR HEVC/MP4 with mastering/CLL
 metadata and exact retained audio packet payloads, identical controlled SDR scoring
 transforms, and anamorphic display-aspect preservation. These verify software
 pipelines, not real HDR monitor capture or gaming visual quality.
+
+## Native clipping HUD
+
+On Windows 11 build 26200, the desktop compositor rendered the toolbar's live
+Acrylic backdrop over a coloured test window. A separate 38% dim layer rendered
+below the toolbar. In a desktop screen grab with capture exclusion enabled, both
+windows were absent. This check used a controlled test window. Live gameplay and
+recorded WGC monitor pixel verification remain open.
+
+The Release build passed core, media, compression, and all three UI scale
+targets. The UI tests verified the moving selection, toolbar width and bounds,
+Auto Compress arming without queuing, and a real fixed-endpoint save at 15 fps.
+The notification suite failed its existing external restart-activation test with
+COM error `0x80040154`.
+
+The HUD uses the existing pinned replay interval and export queue. Its Auto
+Compress toggle now arms the next save. The queue still uses the existing
+same-codec compression policy. Cross-format share profiles remain a separate
+implementation milestone.
+
+## SippingCloftware tray and compact toolbar
+
+The Windows 11 compositor check used a bright gradient window behind the HUD.
+The tinted Acrylic rail rendered charcoal and remained legible when the preset
+panel was open. Both surfaces were checked in the running Qt application.
+
+An isolated Release process started with no visible main window. A posted
+Windows hotkey message opened and dismissed the HUD while the controls remained
+hidden. Opening the controls on demand, closing them back to the tray, and
+exiting the process all passed. The UI suite covers the visible preset panel,
+capture affinity, and the highlight settling on the selected row's bounds.
+
+## Audio switches, startup, and RAM spot check
+
+The export regression uses tagged replay audio tracks. All four switch
+combinations produced the expected track selection and preserved the replay
+segment byte for byte. The WGC toolbar integration also verifies that the
+Mic switch is snapshotted into the job. Physical microphone audio quality
+requires a live microphone check.
+
+On Windows 11, the Release tray averaged 57.6 MiB resident and 37.9 MiB
+private with recording off. The 720p60 H.264 NVENC recording of a synthetic
+window averaged 228.1 MiB resident and 518.9 MiB private over 24 samples.
+Peak sampled resident memory was 234.2 MiB. The recording used WGC and
+system audio. The samples exclude export and do not include GPU memory.
+
+## Shared Acrylic toolbar and menus
+
+The rail, quick presets and advanced option lists share the toolbar's native
+window and capture exclusion. On Windows 11, a compositor check over a colored
+test backdrop showed the same live tint in the rail and preset panel. Sampled
+rail colors and the foreground window stayed identical when the preset panel
+opened. UI tests cover opening and choosing an advanced item and saving a clip
+from the shared toolbar.
+
+The backdrop brush now follows the two rounded HUD surfaces. A live compositor
+render over a gradient showed clear space around the open preset panel. The
+DXGI pixel test kept a fixture pixel unchanged with the 38% dim layer visible.
+The UI suite checks dismissal on Escape and application deactivation, and
+checks that a successful save reports the finished clip's media details.

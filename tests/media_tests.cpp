@@ -170,7 +170,10 @@ class MediaTests : public QObject {
         QVERIFY(QFile::copy(original_, bufferSource));
         clip::ReplayBuffer buffer;
         buffer.begin(0, 300, 1024 * 1024 * 1024);
-        buffer.add({bufferSource, 0, 12, QFileInfo(bufferSource).size()});
+        buffer.add({bufferSource, 0, 12, QFileInfo(bufferSource).size(), {},
+                    {{0, 1, "Earlier Game", "C:/Earlier.exe"},
+                     {5, 6, "Other Game", "C:/Other.exe"},
+                     {6, 8, "Test Game", "C:/Game.exe"}}});
         auto a = buffer.pin(4, 2), b = buffer.pin(8, 3);
         clip::Settings s;
         s.library = directory_.filePath("saved");
@@ -179,8 +182,8 @@ class MediaTests : public QObject {
         s.height = 0;
         s.container = "mp4";
         clip::ExportQueue queue(&buffer, nullptr, directory_.filePath("jobs"));
-        auto first = queue.submitSave(a, s, "Fixture", "");
-        auto second = queue.submitSave(b, s, "Fixture", "");
+        auto first = queue.submitSave(a, s);
+        auto second = queue.submitSave(b, s);
         Q_UNUSED(first);
         Q_UNUSED(second);
         s.encoder = "unavailable";
@@ -188,6 +191,8 @@ class MediaTests : public QObject {
         QTRY_VERIFY_WITH_TIMEOUT(
             queue.jobs().size() == 2 && queue.jobs()[0].terminal && queue.jobs()[1].terminal, 30000);
         auto jobs = queue.jobs();
+        QCOMPARE(QFileInfo(jobs[0].original).dir().dirName(), QString("Desktop"));
+        QCOMPARE(QFileInfo(jobs[1].original).dir().dirName(), QString("Test Game"));
         for (int i = 0; i < 2; ++i) {
             QCOMPARE(jobs[i].state, QString("Complete"));
             auto media = clip::inspect(jobs[i].original);
@@ -200,6 +205,40 @@ class MediaTests : public QObject {
         buffer.stop();
         buffer.clear();
         QCOMPARE(digest(original_), digest_);
+    }
+    void replayAudioToggles() {
+        const auto replay = directory_.filePath("tagged-replay.mkv");
+        QStringList args{"-v", "error", "-y", "-i", original_, "-t", "2", "-map", "0:v:0",
+                         "-map", "0:a:0", "-map", "0:a:1", "-map", "0:a:0", "-c", "copy"};
+        const QStringList roles{"mix-all", "stem-mic", "stem-desktop"};
+        for (int i = 0; i < roles.size(); ++i) {
+            const auto metadata = QString("-metadata:s:a:%1").arg(i);
+            args << metadata << ("sipping_audio_role=" + roles[i])
+                 << metadata << ("title=" + roles[i]);
+        }
+        args << replay;
+        const auto result = clip::runProcess(clip::ffmpegPath(), args, 30000);
+        QVERIFY2(result.code == 0, result.output.constData());
+        const auto hash = digest(replay);
+        clip::Interval interval;
+        interval.start = 0;
+        interval.end = 1;
+        interval.segments.append({replay, 0, 2, QFileInfo(replay).size()});
+        clip::Settings settings;
+        settings.encoder = "libx264";
+        settings.container = "mkv";
+        for (int mode = 0; mode < 4; ++mode) {
+            settings.clipMic = (mode & 1) != 0;
+            settings.clipDesktop = (mode & 2) != 0;
+            const auto out = directory_.filePath(QString("clip-audio-%1.mkv").arg(mode));
+            clip::saveInterval(interval, settings, out);
+            const auto media = clip::inspect(out);
+            QCOMPARE(media.audioTracks, mode == 0 ? 0 : 1);
+            if (mode > 0)
+                QCOMPARE(media.audioStreams.first().toObject()["title"].toString(),
+                         roles[mode == 3 ? 0 : mode]);
+            QCOMPARE(digest(replay), hash);
+        }
     }
     void hdrPreservationAndExplicitSdr() {
         auto hdr = directory_.filePath("hdr.mkv");

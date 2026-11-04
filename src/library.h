@@ -2,6 +2,8 @@
 #include "media.h"
 #include <QThreadPool>
 namespace clip {
+QJsonObject readClipMetadata(const QString &root, const QString &path);
+bool writeClipMetadata(const QString &root, const QString &path, const QJsonObject &metadata);
 struct ClipRecord {
     QString path, application, created, relationship = "original", parent, id;
     QJsonObject media, identity;

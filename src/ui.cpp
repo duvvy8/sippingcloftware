@@ -1,7 +1,10 @@
 #include "ui.h"
 #include "notifications.h"
 #include "editor.h"
+#include "hud_backdrop.h"
 #include <QStandardItemModel>
+#include <QPainterPath>
+#include <algorithm>
 #include <cmath>
 namespace clip {
 namespace {
@@ -111,7 +114,28 @@ void applyAppearance(QApplication &app) {
 }
 MainWindow::MainWindow(bool activationOnly)
     : exports_(&recorder_.buffer(), this), library_(this), hotkeys_(this) {
-    settings_.load();
+    const auto savedSettings = readJson(stateDir() + "/settings.json");
+    settings_.loadObject(savedSettings);
+    if (QDir(settings_.library) == QDir(legacyClipLibrary()))
+        settings_.library = defaultClipLibrary();
+    if (!activationOnly && !savedSettings.contains("recordOnLaunch")) {
+        const auto devices = AudioEngine::devices();
+        for (bool input : {false, true}) {
+            const bool configured = std::any_of(settings_.audio.begin(), settings_.audio.end(),
+                [input](const AudioSource &source) { return (source.kind == "microphone") == input; });
+            if (configured)
+                continue;
+            for (const auto &device : devices)
+                if (device.input == input && device.defaultDevice) {
+                    AudioSource source;
+                    source.id = device.id;
+                    source.name = device.name;
+                    source.kind = input ? "microphone" : "system";
+                    settings_.audio << source;
+                    break;
+                }
+        }
+    }
     for (const auto &job : exports_.jobs())
         if (job.terminal)
             notifiedStates_[job.id] = job.state;
@@ -120,7 +144,7 @@ MainWindow::MainWindow(bool activationOnly)
     auto cache = readJson(stateDir() + "/encoders.json");
     if (cache["key"].toString() == registry_.cacheKey())
         registry_.probe();
-    setWindowTitle("Clips");
+    setWindowTitle(AppName);
     resize(1180, 800);
     setMinimumSize(760, 520);
     auto *body = new QWidget;
@@ -137,32 +161,29 @@ MainWindow::MainWindow(bool activationOnly)
     setCentralWidget(body);
     toolbar_ = new ClipToolbar(this);
     auto *menu = new QMenu(this);
-    menu->addAction("Clips", this, [this] {
-        showNormal();
-        raise();
-        activateWindow();
-    });
-    menu->addAction("Clipping toolbar", toolbar_, &ClipToolbar::open);
-    menu->addAction("Start / stop recording", this, &MainWindow::toggleRecording);
+    auto *openControls = menu->addAction("Open SippingCloftware", this, &MainWindow::showControls);
+    menu->setDefaultAction(openControls);
+    menu->addAction("Open clip toolbar", toolbar_, &ClipToolbar::open);
+    recordAction_ = menu->addAction("Start recording", this, &MainWindow::toggleRecording);
     menu->addSeparator();
     menu->addAction("Exit", this, &MainWindow::exitApplication);
     QPixmap icon(24, 24);
     icon.fill(Qt::transparent);
     {
         QPainter p(&icon);
-        p.setBrush(QColor(145, 152, 163));
+        p.setRenderHint(QPainter::Antialiasing);
+        p.setPen(QPen(QColor("#e2e9ef"), 1.7));
+        p.drawRoundedRect(QRectF(2.5, 4.5, 19, 15), 3, 3);
         p.setPen(Qt::NoPen);
-        p.drawEllipse(5, 5, 14, 14);
+        p.setBrush(QColor("#a0e1b9"));
+        p.drawPolygon(QPolygonF{QPointF(10, 8), QPointF(10, 16), QPointF(16, 12)});
     }
     tray_ = new QSystemTrayIcon(QIcon(icon), this);
-    tray_->setToolTip("Recording off");
+    tray_->setToolTip(QString(AppName) + " · Recording off");
     tray_->setContextMenu(menu);
     connect(tray_, &QSystemTrayIcon::activated, this, [this](auto reason) {
-        if (reason == QSystemTrayIcon::DoubleClick) {
-            showNormal();
-            raise();
-            activateWindow();
-        }
+        if (reason == QSystemTrayIcon::Trigger || reason == QSystemTrayIcon::DoubleClick)
+            showControls();
     });
     tray_->show();
     QString error;
@@ -189,12 +210,14 @@ MainWindow::MainWindow(bool activationOnly)
             if (clips_->item(i, 0)->data(Qt::UserRole).toString() == path)
                 clips_->item(i, 0)->setIcon(QPixmap::fromImage(image));
     });
+    connect(&exports_, &ExportQueue::clipSaved, this, &MainWindow::clipSaved);
     connect(&exports_, &ExportQueue::jobChanged, this, [this](const QString &id) {
         updateJobs();
         for (const auto &job : exports_.jobs())
             if (job.id == id && job.terminal && notifiedStates_.value(id) != job.state) {
                 notifiedStates_[id] = job.state;
-                emit notificationReady(id);
+                if (job.kind != "save" || job.state != "Complete")
+                    emit notificationReady(id);
             }
         for (const auto &job : exports_.jobs())
             if (job.id == id && job.terminal &&
@@ -219,7 +242,7 @@ MainWindow::MainWindow(bool activationOnly)
     refreshLibrary();
     updateJobs();
     if (settings_.autoRecord && !activationOnly)
-        QTimer::singleShot(0, this, &MainWindow::toggleRecording);
+        QTimer::singleShot(0, this, [this] { startRecording(true); });
 }
 MainWindow::~MainWindow() {
     cancelDiscovery_ = true;
@@ -319,7 +342,7 @@ QWidget *MainWindow::clipsPage() {
             QString encoder = registry_.forCodec(info.codecId, {}, info.hdr);
             if (encoder.isEmpty() && info.bytes > SizeLimit)
                 throw std::runtime_error("Test an implementation of this clip's codec before compression");
-            exports_.submitCompression(selectedPath_, encoder);
+            exports_.submitCompression(selectedPath_, encoder, settings_.library);
         } catch (const std::exception &e) {
             showError(QString::fromUtf8(e.what()));
         }
@@ -624,14 +647,18 @@ QWidget *MainWindow::settingsPage() {
     binding("Start / stop recording", "record", settings_.recordHotkey);
     binding("Microphone push-to-talk", "ptt", settings_.pttHotkey);
     v->addWidget(shortcuts);
-    auto *startup = new QCheckBox("Launch hidden at sign-in");
+    auto *startup = new QCheckBox("Open SippingCloftware when I sign in to Windows");
     startup->setChecked(settings_.startup);
     auto *record = new QCheckBox("Start recording automatically when launched");
     record->setChecked(settings_.autoRecord);
     auto *notifications = new QCheckBox("Show Windows notifications");
     notifications->setChecked(settings_.notifications);
+    auto *border = new QCheckBox("Prefer borderless capture for SDR displays");
+    border->setChecked(settings_.borderlessDisplay);
+    border->setToolTip("Applies when recording next starts. Windows may show a border for window or HDR capture.");
     v->addWidget(startup);
     v->addWidget(record);
+    v->addWidget(border);
     v->addWidget(notifications);
     connect(startup, &QCheckBox::clicked, this, [this, startup](bool enabled) {
         QString error;
@@ -646,6 +673,11 @@ QWidget *MainWindow::settingsPage() {
     connect(record, &QCheckBox::clicked, this, [this](bool enabled) {
         settings_.autoRecord = enabled;
         settings_.save();
+    });
+    connect(border, &QCheckBox::clicked, this, [this](bool enabled) {
+        settings_.borderlessDisplay = enabled;
+        settings_.save();
+        status_->setText("Border preference applies when recording next starts");
     });
     connect(notifications, &QCheckBox::clicked, this, [this](bool enabled) {
         settings_.notifications = enabled;
@@ -910,21 +942,32 @@ void MainWindow::applyRecording() {
     }
 }
 void MainWindow::toggleRecording() {
+    toolbar_->hide();
     if (recorder_.active()) {
         recorder_.stop();
         updateStatus();
         return;
     }
+    startRecording(false);
+}
+void MainWindow::startRecording(bool atLaunch) {
+    if (recorder_.active())
+        return;
     try {
         auto s = readRecording();
+        if (s.monitor < 0 || s.monitor >= registry_.displays.size())
+            throw std::runtime_error("Select an attached capture display");
+        const auto display = registry_.displays[s.monitor];
+        if (atLaunch && s.source == "window" && !s.window)
+            throw std::runtime_error("Reselect the capture window to resume recording");
+        if (atLaunch && display.hdr && !s.hdr && !s.toneMapCapture)
+            throw std::runtime_error("Review HDR capture settings before recording this display");
         const bool approved = std::exchange(resetApproved_, false);
         if (!approveSdrRecording(s))
             return;
+        bool basicProfile = false;
         if (s.encoder == "auto") {
             s.encoder = registry_.automatic(s.hdr);
-            if (s.encoder.isEmpty())
-                throw std::runtime_error("Run Test Encoders and Calibrate Capture before automatic "
-                                         "recording, or choose a tested encoder explicitly.");
             auto *candidate = registry_.find(s.encoder);
             bool matched = false;
             if (candidate)
@@ -940,18 +983,30 @@ void MainWindow::toggleRecording() {
                         profile["hdr"].toBool() == s.hdr)
                         matched = true;
                 }
-            if (!matched)
-                throw std::runtime_error("The capture profile changed since calibration. Calibrate the "
-                                         "selected settings before using automatic recording.");
+            if (!matched) {
+                if (!atLaunch || s.hdr)
+                    throw std::runtime_error(s.encoder.isEmpty()
+                        ? "Run Test Encoders and Calibrate Capture before automatic recording, or choose a tested encoder."
+                        : "The capture profile changed since calibration. Calibrate the selected settings before using automatic recording.");
+                s.encoder = "libx264";
+                for (auto &caps : registry_.encoders)
+                    if (caps.name == s.encoder && !caps.encoded) {
+                        const auto probe = Registry::testEncoder(s.encoder);
+                        caps.initialized = probe["initialized"].toBool();
+                        caps.encoded = probe["encoded"].toBool();
+                        caps.tested.append(probe);
+                        break;
+                    }
+                s.fps = qMin(s.fps, qMin(30, int(display.refresh)));
+                s.height = qMin(s.height > 0 ? s.height : display.height, qMin(720, display.height));
+                basicProfile = true;
+            }
         }
         auto *c = registry_.find(s.encoder);
         if (!c || !c->encoded)
             throw std::runtime_error("Selected encoder has not passed its test");
         if (!c->containers.contains(s.container))
             throw std::runtime_error("Selected codec is incompatible with the chosen export container");
-        if (s.monitor < 0 || s.monitor >= registry_.displays.size())
-            throw std::runtime_error("Select an attached capture display");
-        auto display = registry_.displays[s.monitor];
         if (s.height > display.height)
             throw std::runtime_error("Recording resolution cannot exceed the selected source");
         if (s.fps > display.refresh)
@@ -969,8 +1024,16 @@ void MainWindow::toggleRecording() {
         recorder_.start(s, registry_);
         recorded_ = s;
         updateStatus();
+        if (basicProfile)
+            status_->setText("Recording with the basic startup profile. Calibrate to use your preferred profile.");
     } catch (const std::exception &e) {
-        showError(QString::fromUtf8(e.what()));
+        const auto message = QString::fromUtf8(e.what());
+        if (atLaunch) {
+            status_->setText("Recording did not start · " + message);
+            if (settings_.notifications)
+                tray_->showMessage(AppName, status_->text(), QSystemTrayIcon::Warning);
+        } else
+            showError(message);
     }
 }
 void MainWindow::probeEncoders() {
@@ -1266,7 +1329,8 @@ void MainWindow::updateStatus() {
         recordStats_->setText(recordStats_->text() + '\n' + s.audioNotice);
     recordStats_->setStyleSheet(s.error.isEmpty() ? (s.active ? "color:#87d7aa" : "color:#c7ccd5")
                                                   : "color:#ff9b9b");
-    tray_->setToolTip(s.active ? "Recording · " + durationText(s.elapsed) : "Recording off");
+    recordAction_->setText(s.active ? "Stop recording" : "Start recording");
+    tray_->setToolTip(QString(AppName) + (s.active ? " · Recording " + durationText(s.elapsed) : " · Recording off"));
 }
 void MainWindow::showPlayer(const QString &path) {
     auto *dialog = new QDialog(this);
@@ -1344,7 +1408,7 @@ void MainWindow::handleNotificationAction(const QString &arguments) {
             if (!recorder_.active())
                 refreshLibrary();
         } else {
-            QString path = !job.output.isEmpty() ? job.output : job.original;
+            QString path = action.action != "open-original" && !job.output.isEmpty() ? job.output : job.original;
             auto identity = path == job.original ? job.details["originalIdentity"].toObject()
                                                  : job.details["outputIdentity"].toObject();
             if (identity.isEmpty() || fileIdentity(path) != identity)
@@ -1379,7 +1443,7 @@ void MainWindow::showEditor(int tab, bool sdr) {
                         if (chosen.isEmpty())
                             throw std::runtime_error(
                                 "No verified H.264 encoder is available for SDR sharing");
-                        exports_.submitEdit(original, request, chosen, "High");
+                        exports_.submitEdit(original, request, chosen, "High", settings_.library);
                     } catch (const std::exception &e) {
                         showError(QString::fromUtf8(e.what()));
                     }
@@ -1392,10 +1456,23 @@ void MainWindow::showEditor(int tab, bool sdr) {
 void MainWindow::closeEvent(QCloseEvent *event) {
     if (exiting_)
         event->accept();
-    else {
+    else if (!QSystemTrayIcon::isSystemTrayAvailable()) {
+        event->accept();
+        exitApplication();
+    } else {
         hide();
         event->ignore();
     }
+}
+void MainWindow::showControls() {
+    toolbar_->hide();
+    showNormal();
+    const auto handle = HWND(winId());
+    // A process launched with SW_HIDE can have its first native show suppressed.
+    if (!IsWindowVisible(handle))
+        ShowWindow(handle, SW_SHOW);
+    raise();
+    activateWindow();
 }
 void MainWindow::exitApplication() {
     exiting_ = true;
@@ -1406,61 +1483,431 @@ void MainWindow::exitApplication() {
     tray_->hide();
     QCoreApplication::quit();
 }
+class ClipChoiceStack : public QWidget {
+    QComboBox *model_;
+    QPushButton *summary_;
+    QVBoxLayout *rows_;
+    QWidget *highlight_;
+    QPropertyAnimation *slide_;
+    QList<QPushButton *> buttons_;
+    QList<int> indices_;
+    static constexpr int RowHeight = 34;
+
+    void sync(bool animate) {
+        slide_->stop();
+        const int row = int(indices_.indexOf(model_->currentIndex()));
+        for (int i = 0; i < buttons_.size(); ++i)
+            buttons_[i]->setChecked(i == row);
+        const auto selected = selectedLabel();
+        summary_->setText(selected);
+        summary_->setToolTip(model_->accessibleName() + " · " + selected);
+        summary_->setAccessibleName(model_->accessibleName() + " choices");
+        const bool wasVisible = highlight_->isVisible();
+        highlight_->setVisible(row >= 0);
+        if (row < 0)
+            return;
+        const QRect target = buttons_[row]->geometry().adjusted(0, 2, 0, -2);
+        BOOL transitions = TRUE;
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &transitions, 0);
+        if (animate && transitions && wasVisible && isVisible()) {
+            slide_->setStartValue(highlight_->geometry());
+            slide_->setEndValue(target);
+            slide_->start();
+        } else
+            highlight_->setGeometry(target);
+    }
+
+  public:
+    ClipChoiceStack(QComboBox *model, QPushButton *summary, QWidget *parent)
+        : QWidget(parent), model_(model), summary_(summary), rows_(new QVBoxLayout(this)), highlight_(new QWidget(this)),
+          slide_(new QPropertyAnimation(highlight_, "geometry", this)) {
+        setStyleSheet(R"(
+            QWidget { background:transparent; }
+            QWidget#clipSelection { background:#323a40; border-radius:6px; }
+            QWidget#clipSelectionMark { background:#a0e1b9; border-radius:1px; }
+            QPushButton { background:transparent; border:1px solid transparent; border-radius:6px;
+                          padding:0 11px; color:#dce1e6; text-align:left; }
+            QPushButton:hover { background:rgba(255,255,255,13); }
+            QPushButton:pressed { background:rgba(255,255,255,23); }
+            QPushButton:checked { color:#fff; }
+            QPushButton:disabled { color:#777f88; }
+            QPushButton:focus { border-color:#80949f; }
+        )");
+        highlight_->setObjectName("clipSelection");
+        highlight_->setAttribute(Qt::WA_TransparentForMouseEvents);
+        auto *mark = new QWidget(highlight_);
+        mark->setObjectName("clipSelectionMark");
+        mark->setGeometry(0, (RowHeight - 4 - 12) / 2, 2, 12);
+        slide_->setDuration(155);
+        slide_->setEasingCurve(QEasingCurve::OutCubic);
+        rows_->setContentsMargins(0, 0, 0, 0);
+        rows_->setSpacing(0);
+        connect(model_, &QComboBox::currentIndexChanged, this, [this] { sync(true); });
+    }
+
+    void populate(const QList<QPair<QVariant, QString>> &choices) {
+        slide_->stop();
+        for (auto *button : buttons_)
+            delete button;
+        buttons_.clear();
+        indices_.clear();
+        auto *items = qobject_cast<QStandardItemModel *>(model_->model());
+        for (const auto &[value, label] : choices) {
+            const int index = model_->findData(value);
+            if (index < 0 || indices_.contains(index))
+                continue;
+            auto *button = new QPushButton(label, this);
+            button->setAccessibleName(model_->accessibleName() + ": " + label);
+            button->setCheckable(true);
+            button->setFixedHeight(RowHeight);
+            button->setEnabled(!items || items->item(index)->isEnabled());
+            button->setToolTip(model_->itemData(index, Qt::ToolTipRole).toString());
+            rows_->addWidget(button);
+            buttons_ << button;
+            indices_ << index;
+            connect(button, &QPushButton::clicked, this, [this, index] {
+                if (model_->currentIndex() == index) {
+                    sync(false);
+                    return;
+                }
+                model_->setCurrentIndex(index);
+            });
+        }
+        setFixedHeight(int(buttons_.size()) * RowHeight);
+        rows_->activate();
+        highlight_->lower();
+        sync(false);
+    }
+
+    QString selectedLabel() const {
+        const auto row = indices_.indexOf(model_->currentIndex());
+        return row >= 0 ? buttons_[row]->text() : model_->currentText();
+    }
+
+    void focusSelection() {
+        const auto row = indices_.indexOf(model_->currentIndex());
+        if (row >= 0 && buttons_[row]->isEnabled())
+            buttons_[row]->setFocus();
+        else
+            for (auto *button : buttons_)
+                if (button->isEnabled()) {
+                    button->setFocus();
+                    break;
+                }
+    }
+
+  protected:
+    void resizeEvent(QResizeEvent *event) override {
+        QWidget::resizeEvent(event);
+        rows_->activate();
+        sync(false);
+    }
+    void showEvent(QShowEvent *event) override {
+        QWidget::showEvent(event);
+        rows_->activate();
+        sync(false);
+    }
+};
+
+class HudComboBox : public QComboBox {
+  public:
+    std::function<void(HudComboBox *)> openChoices;
+    using QComboBox::QComboBox;
+
+    void showPopup() override {
+        openChoices(this);
+    }
+
+    void choose(int index) {
+        setCurrentIndex(index);
+        emit activated(index);
+    }
+};
+
+namespace {
+bool animateWindowsUi() {
+    BOOL transitions = TRUE;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &transitions, 0);
+    return transitions != FALSE;
+}
+
+void slideIn(QWidget *window, QPropertyAnimation *motion, int offset) {
+    if (!animateWindowsUi())
+        return;
+    const QPoint target = window->pos();
+    const int left = window->screen()->availableGeometry().left();
+    const int travel = window->isWindow() ? qBound(0, window->geometry().left() - left, offset) : offset;
+    motion->setStartValue(target - QPoint(travel, 0));
+    motion->setEndValue(target);
+    motion->start();
+}
+
+class HudOptionButton : public QPushButton {
+  public:
+    using QPushButton::QPushButton;
+
+  protected:
+    void paintEvent(QPaintEvent *event) override {
+        QPushButton::paintEvent(event);
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        p.setPen(QPen(isChecked() ? QColor("#e3ecef") : QColor("#9aa5ae"), 1.25,
+                      Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        const QPointF center(width() - 12, height() / 2.0);
+        p.drawPolyline(QPolygonF{center + QPointF(-1.5, -3), center + QPointF(1.5, 0),
+                                 center + QPointF(-1.5, 3)});
+    }
+};
+
+QIcon hudIcon(QColor color, bool save, bool recording = false) {
+    QPixmap image(32, 32);
+    image.setDevicePixelRatio(2);
+    image.fill(Qt::transparent);
+    QPainter p(&image);
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setPen(Qt::NoPen);
+    p.setBrush(color);
+    if (save)
+        p.drawPolygon(QPolygonF{QPointF(4, 2.5), QPointF(13, 8), QPointF(4, 13.5)});
+    else if (recording)
+        p.drawRoundedRect(QRectF(3, 3, 10, 10), 1.5, 1.5);
+    else
+        p.drawEllipse(QRectF(3, 3, 10, 10));
+    return QIcon(image);
+}
+
+void addHudDivider(QVBoxLayout *layout) {
+    auto *line = new QFrame;
+    line->setFixedHeight(1);
+    line->setStyleSheet("background:rgba(226,235,243,30); border:none");
+    layout->addWidget(line);
+}
+} // namespace
+
 ClipToolbar::ClipToolbar(MainWindow *owner)
-    : QWidget(owner, Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint), owner_(owner) {
+    : QWidget(owner, Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint), owner_(owner),
+      backdrop_(std::make_unique<HudBackdrop>()) {
     setWindowTitle("Clipping toolbar");
+    setObjectName("clipToolbar");
     setAttribute(Qt::WA_DeleteOnClose, false);
-    auto *v = new QVBoxLayout(this);
-    v->setContentsMargins(14, 14, 14, 14);
-    v->setSpacing(8);
-    record_ = button("Start Recording", v, [this] {
-        owner_->toggleRecording();
-        hide();
+    setFont(QFont("Segoe UI Variable Text", 10));
+    setAttribute(Qt::WA_TranslucentBackground);
+    new QShortcut(QKeySequence(Qt::Key_Escape), this, [this] { hide(); });
+    connect(qApp, &QGuiApplication::applicationStateChanged, this, [this](Qt::ApplicationState state) {
+        if (state != Qt::ApplicationActive && isVisible())
+            hide();
     });
-    auto selector = [&](const QString &label, QComboBox *&box) {
-        v->addWidget(new QLabel(label));
-        box = new QComboBox;
-        box->setFont(mono());
-        box->setMinimumHeight(34);
-        box->setAccessibleName(label);
-        v->addWidget(box);
+    setStyleSheet(R"(
+        QWidget#clipToolbar, QWidget#clipRail, QWidget#clipOptions, QWidget#clipAdvanced { background:transparent; }
+        QPushButton { background:transparent; border:1px solid transparent; border-radius:6px;
+                      padding:0 4px; color:#ecf1f4; }
+        QPushButton:hover { background:rgba(255,255,255,19); }
+        QPushButton:pressed { background:rgba(255,255,255,29); }
+        QPushButton:disabled { color:#838b92; }
+        QPushButton:checked { background:#303940; }
+        QPushButton:focus { border-color:#80949f; }
+        QPushButton[quickChoice="true"] { text-align:left; padding:0 20px 0 8px; }
+        QPushButton#compressToggle:checked { color:#b2edc8; background:#24382e; }
+        QPushButton[audioToggle="true"] { color:#929da6; text-align:left; padding:0 8px; }
+        QPushButton[audioToggle="true"]:checked { color:#dcebe4; background:#23332d; }
+    )");
+    dim_ = new QWidget(nullptr, Qt::Tool | Qt::FramelessWindowHint | Qt::WindowDoesNotAcceptFocus |
+                                Qt::WindowTransparentForInput | Qt::WindowStaysOnTopHint);
+    dim_->setWindowTitle("Clipping toolbar dimmer");
+    dim_->setAttribute(Qt::WA_ShowWithoutActivating);
+    dim_->setStyleSheet("background:#000");
+    dim_->setWindowOpacity(.38);
+    hudMotion_ = new QPropertyAnimation(this, "pos", this);
+    panelMotion_ = new QPropertyAnimation;
+    panelMotion_->setParent(this);
+    panelMotion_->setPropertyName("pos");
+    dimMotion_ = new QPropertyAnimation(dim_, "windowOpacity", this);
+    for (auto *motion : {hudMotion_, panelMotion_, dimMotion_}) {
+        motion->setDuration(160);
+        motion->setEasingCurve(QEasingCurve::OutCubic);
+    }
+    connect(panelMotion_, &QPropertyAnimation::valueChanged, this, [this] { updateSurfaceMask(); });
+    rail_ = new QWidget(this);
+    rail_->setObjectName("clipRail");
+    rail_->setFixedWidth(110);
+    options_ = new QWidget(this);
+    options_->setObjectName("clipOptions");
+    options_->setStyleSheet(R"(
+        QWidget#clipOptions { background:transparent; }
+        QLabel { color:#aeb9c2; }
+    )");
+    options_->setFixedWidth(156);
+    auto *optionLayout = new QVBoxLayout(options_);
+    optionLayout->setContentsMargins(5, 7, 5, 5);
+    optionLayout->setSpacing(4);
+    optionTitle_ = new QLabel(options_);
+    optionTitle_->setContentsMargins(8, 1, 0, 1);
+    optionTitle_->setFont(QFont("Segoe UI Variable Text", 9));
+    optionLayout->addWidget(optionTitle_);
+    optionPages_ = new QStackedWidget(options_);
+    optionPages_->setStyleSheet("QStackedWidget { background:transparent; }");
+    optionLayout->addWidget(optionPages_);
+    options_->hide();
+    advanced_ = new QWidget(this);
+    advanced_->setObjectName("clipAdvanced");
+    advanced_->setStyleSheet(R"(
+        QLabel { color:#ecf1f4; }
+        QPushButton,QComboBox { background:rgba(48,54,60,200); border:1px solid #51585f; border-radius:5px; padding:5px; }
+        QListView { background:transparent; border:none; outline:none; }
+        QListView::item { min-height:26px; padding:0 8px; }
+        QListView::item:selected { background:#323a40; color:#fff; }
+    )");
+    advancedPages_ = new QStackedLayout(advanced_);
+    auto *advancedForm = new QWidget(advanced_);
+    auto *advancedList = new QWidget(advanced_);
+    advancedForm->setObjectName("clipAdvancedForm");
+    advancedList->setObjectName("clipAdvancedList");
+    advancedForm->setStyleSheet("QWidget#clipAdvancedForm { background:transparent; }");
+    advancedList->setStyleSheet("QWidget#clipAdvancedList { background:transparent; }");
+    advancedPages_->addWidget(advancedForm);
+    advancedPages_->addWidget(advancedList);
+    auto *a = new QFormLayout(advancedForm);
+    auto *listLayout = new QVBoxLayout(advancedList);
+    auto *back = new QPushButton("Back to clip options", advancedList);
+    auto *list = new QListView(advancedList);
+    list->setObjectName("hudAdvancedChoices");
+    list->setAccessibleName("Advanced clip choices");
+    listLayout->addWidget(back);
+    listLayout->addWidget(list);
+    const auto closeList = [this] {
+        auto *combo = std::exchange(openCombo_, nullptr);
+        advancedPages_->setCurrentIndex(0);
+        if (combo) {
+            combo->hidePopup();
+            combo->setFocus();
+        }
+        return combo;
     };
-    selector("Container", container_);
-    selector("Frame rate", fps_);
-    selector("Resolution", resolution_);
-    selector("Duration", duration_);
-    available_ = new QLabel;
+    connect(back, &QPushButton::clicked, this, closeList);
+    const auto selectItem = [this, closeList](const QModelIndex &index) {
+        if (openCombo_ && index.isValid() && index.flags().testFlag(Qt::ItemIsEnabled))
+            closeList()->choose(index.row());
+    };
+    connect(list, &QListView::clicked, this, selectItem);
+    connect(list, &QListView::activated, this, selectItem);
+    const auto makeCombo = [this, advancedForm, list] {
+        auto *combo = new HudComboBox(advancedForm);
+        combo->setFont(mono());
+        combo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+        combo->setMinimumContentsLength(13);
+        combo->openChoices = [this, list](HudComboBox *selected) {
+            openCombo_ = selected;
+            list->setModel(selected->model());
+            list->setAccessibleName(selected->accessibleName() + " choices");
+            list->setCurrentIndex(selected->model()->index(selected->currentIndex(), 0));
+            advancedPages_->setCurrentIndex(1);
+            list->setFocus();
+        };
+        return combo;
+    };
+    advanced_->hide();
+    auto *v = new QVBoxLayout(rail_);
+    v->setContentsMargins(5, 5, 5, 5);
+    v->setSpacing(2);
+    auto *controls = new QHBoxLayout;
+    controls->setSpacing(2);
+    save_ = button({}, controls, [this] { submit(); });
+    save_->setAccessibleName("Save Clip");
+    save_->setIcon(hudIcon(QColor("#a0e1b9"), true));
+    record_ = button({}, controls, [this] { owner_->toggleRecording(); });
+    for (auto *control : {save_, record_}) {
+        control->setIconSize(QSize(16, 16));
+        control->setFixedSize(49, 32);
+    }
+    v->addLayout(controls);
+    addHudDivider(v);
+    auto selector = [&](const QString &label, QComboBox *&box, ClipChoiceStack *&stack) {
+        box = makeCombo();
+        box->setAccessibleName(label);
+        a->addRow(label, box);
+        auto *summary = new HudOptionButton(rail_);
+        summary->setCheckable(true);
+        summary->setProperty("quickChoice", true);
+        summary->setFixedHeight(31);
+        v->addWidget(summary);
+        auto *choices = new ClipChoiceStack(box, summary, optionPages_);
+        stack = choices;
+        optionPages_->addWidget(choices);
+        connect(summary, &QPushButton::clicked, this, [this, choices, summary, label] {
+            showOptions(choices, summary, label);
+        });
+    };
+    selector("Container", container_, formatStack_);
+    selector("Frame rate", fps_, fpsStack_);
+    selector("Resolution", resolution_, resolutionStack_);
+    selector("Quality", quality_, qualityStack_);
+    quality_->addItems({"Maximum", "High", "Balanced", "Compact"});
+    for (int i = 0; i < quality_->count(); ++i)
+        quality_->setItemData(i, quality_->itemText(i));
+    selector("Duration", duration_, durationStack_);
+    addHudDivider(v);
+    compress_ = new QPushButton("Auto Compress", rail_);
+    compress_->setObjectName("compressToggle");
+    compress_->setAccessibleName("Auto Compress");
+    compress_->setCheckable(true);
+    compress_->setFixedHeight(32);
+    compress_->setFont(QFont("Segoe UI Variable Text", 9));
+    compress_->setToolTip("When armed, Save Clip also attempts a separate copy within 20 MB");
+    v->addWidget(compress_);
+    auto audioToggle = [&](const QString &name, const QString &description) {
+        auto *toggle = new QPushButton(name, rail_);
+        toggle->setProperty("audioToggle", true);
+        toggle->setAccessibleName(name);
+        toggle->setCheckable(true);
+        toggle->setChecked(true);
+        toggle->setFixedHeight(29);
+        toggle->setFont(QFont("Segoe UI Variable Text", 9));
+        toggle->setToolTip(description + " · applies only to this saved clip");
+        v->addWidget(toggle);
+        return toggle;
+    };
+    mic_ = audioToggle("Mic", "Include buffered microphone audio");
+    desktop_ = audioToggle("Desktop Audio", "Include buffered desktop and application audio");
+    partial_ = new QLabel(rail_);
+    partial_->setAlignment(Qt::AlignCenter);
+    partial_->setFont(QFont("Segoe UI Variable Text", 9));
+    partial_->setStyleSheet("color:#b4bec7");
+    partial_->hide();
+    v->addWidget(partial_);
+    available_ = new QLabel(advancedForm);
     available_->setWordWrap(true);
     available_->setFont(mono());
-    v->addWidget(available_);
-    compress_ = button("Auto Compress", v, [this] { submit(true); });
-    compress_->setToolTip(
-        "Save and validate the original, then attempt a same-codec copy within 20 MB and the quality guard");
-    save_ = button("Save Clip", v, [this] { submit(); });
-    button("Show Folder", v,
-           [this] { QDesktopServices::openUrl(QUrl::fromLocalFile(owner_->settings_.library)); });
-    auto *advanced = new QWidget(this, Qt::Popup);
-    auto *a = new QFormLayout(advanced);
-    quality_ = new QComboBox;
-    quality_->addItems({"Maximum", "High", "Balanced", "Compact"});
-    encoder_ = new QComboBox;
-    encoder_->setFont(mono());
-    a->addRow("Export quality", quality_);
+    a->addRow(available_);
+    encoder_ = makeCombo();
+    encoder_->setAccessibleName("Codec / implementation");
     a->addRow("Codec / implementation", encoder_);
-    auto *explanation = new QLabel("Export settings apply only to this clip. Higher resolution, extra frames "
-                                   "and lost detail cannot be recovered.");
-    explanation->setWordWrap(true);
-    explanation->setMaximumWidth(360);
-    a->addRow(explanation);
-    button("Quality and Codec…", v, [this, advanced] {
-        advanced->move(mapToGlobal(QPoint(width() + 8, 20)));
-        if (!excludeFromCapture(quintptr(advanced->winId()))) {
-            owner_->showError("Windows could not exclude the options panel from capture");
+    auto *folder = new QPushButton("Show Folder", advancedForm);
+    a->addRow(folder);
+    connect(folder, &QPushButton::clicked, this,
+            [this] { QDesktopServices::openUrl(QUrl::fromLocalFile(owner_->settings_.library)); });
+    auto *utility = new QHBoxLayout;
+    utility->setSpacing(2);
+    auto *more = new QPushButton(QStringLiteral("···"), rail_);
+    more->setFixedSize(49, 28);
+    more->setAccessibleName("More clip options");
+    more->setToolTip("More clip options");
+    utility->addWidget(more);
+    auto *close = new QPushButton(QStringLiteral("×"), rail_);
+    close->setAccessibleName("Close toolbar");
+    close->setToolTip("Close toolbar (Esc)");
+    close->setFixedSize(49, 28);
+    utility->addWidget(close);
+    v->addLayout(utility);
+    connect(close, &QPushButton::clicked, this, &QWidget::hide);
+    connect(more, &QPushButton::clicked, this, [this, more] {
+        const bool open = advanced_->isHidden();
+        hidePanel();
+        if (!open)
             return;
-        }
-        advanced->show();
+        placePanel(advanced_, more);
+        panelMotion_->setTargetObject(advanced_);
+        slideIn(advanced_, panelMotion_, 6);
     });
-    button("Dismiss", v, [this] { hide(); });
     connect(duration_, &QComboBox::currentIndexChanged, this, [this] {
         int seconds = duration_->currentData().toInt();
         if (seconds < 0) {
@@ -1478,34 +1925,30 @@ ClipToolbar::ClipToolbar(MainWindow *owner)
                 duration_->setCurrentIndex(1);
             return;
         }
-        available_->setText(QString("Available: %1\nThis clip: %2\nEndpoint: %3")
-                                .arg(durationText(pin_.duration()))
-                                .arg(durationText(qMin(double(seconds), pin_.duration())))
-                                .arg(endpoint_, 0, 'f', 3));
+        showDuration();
     });
-    connect(encoder_, &QComboBox::currentIndexChanged, this, [this] {
-        auto *cap = owner_->registry_.find(encoder_->currentData().toString());
-        QString selected = container_->currentData().toString();
-        container_->clear();
-        if (cap)
-            for (auto name : {"mp4", "mkv", "webm", "mov"})
-                addChoice(container_, QString(name).toUpper(), name, cap->containers.contains(name),
-                          "Selected codec is incompatible with this container");
-        selectValue(container_, selected);
-        if (container_->currentIndex() >= 0) {
-            auto *model = qobject_cast<QStandardItemModel *>(container_->model());
-            if (model && !model->item(container_->currentIndex())->isEnabled())
-                for (int i = 0; i < container_->count(); ++i)
-                    if (model->item(i)->isEnabled()) {
-                        container_->setCurrentIndex(i);
-                        break;
-                    }
-        }
+    connect(container_, &QComboBox::currentIndexChanged, this, [this] {
+        const auto choice = encoderForContainer(container_->currentData().toString());
+        if (!choice.isEmpty())
+            selectValue(encoder_, choice);
+        const bool canSave = !pin_.id.isEmpty() && !choice.isEmpty();
+        save_->setEnabled(canSave);
+        compress_->setEnabled(canSave);
+        showDuration();
     });
-    setFixedWidth(230);
+    connect(encoder_, &QComboBox::activated, this, [this] {
+        const auto *cap = owner_->registry_.find(encoder_->currentData().toString());
+        if (cap && !cap->containers.contains(container_->currentData().toString()))
+            for (int i = 0; i < container_->count(); ++i)
+                if (cap->containers.contains(container_->itemData(i).toString())) {
+                    container_->setCurrentIndex(i);
+                    break;
+                }
+    });
 }
 ClipToolbar::~ClipToolbar() {
     release();
+    delete dim_;
 }
 void ClipToolbar::release() {
     if (!pin_.id.isEmpty()) {
@@ -1518,8 +1961,26 @@ void ClipToolbar::release() {
     }
 }
 void ClipToolbar::hideEvent(QHideEvent *event) {
+    hudMotion_->stop();
+    dimMotion_->stop();
+    hidePanel();
+    backdrop_->hide();
+    dim_->hide();
     release();
     QWidget::hideEvent(event);
+}
+void ClipToolbar::paintEvent(QPaintEvent *) {
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setPen(QPen(QColor(219, 231, 241, 63), 1));
+    p.setBrush(acrylic_ ? QColor(17, 20, 23, 166) : QColor("#1c2024"));
+    for (auto *surface : {rail_, options_, advanced_})
+        if (!surface->isHidden())
+            p.drawRoundedRect(QRectF(surface->geometry()).adjusted(.5, .5, -.5, -.5), 6, 6);
+}
+void ClipToolbar::moveEvent(QMoveEvent *event) {
+    QWidget::moveEvent(event);
+    updateBackdrop();
 }
 void ClipToolbar::keyPressEvent(QKeyEvent *event) {
     if (event->key() == Qt::Key_Escape) {
@@ -1528,8 +1989,138 @@ void ClipToolbar::keyPressEvent(QKeyEvent *event) {
     } else
         QWidget::keyPressEvent(event);
 }
+QString ClipToolbar::encoderForContainer(const QString &container) const {
+    const auto compatible = [&](const EncoderCaps &cap) {
+        return cap.encoded && (!recorded_.hdr || cap.hdr) && cap.containers.contains(container);
+    };
+    if (const auto *cap = owner_->registry_.find(encoder_->currentData().toString()); cap && compatible(*cap))
+        return cap->name;
+    const auto preferred = recorded_.hdr ? AV_CODEC_ID_HEVC : container == "webm" ? AV_CODEC_ID_VP9 : AV_CODEC_ID_H264;
+    for (const auto &cap : owner_->registry_.encoders)
+        if (cap.codecId == preferred && !cap.hardware && compatible(cap))
+            return cap.name;
+    for (const auto &cap : owner_->registry_.encoders)
+        if (compatible(cap))
+            return cap.name;
+    return {};
+}
+void ClipToolbar::placePanel(QWidget *panel, QWidget *anchor) {
+    panel->adjustSize();
+    const auto area = screen()->availableGeometry();
+    const int availableHeight = area.bottom() - mapToGlobal(QPoint()).y() + 1;
+    panel->move(rail_->width() + 7,
+                qBound(0, anchor->mapTo(this, QPoint()).y(), qMax(0, availableHeight - panel->height())));
+    panel->show();
+    layoutSurfaces();
+}
+void ClipToolbar::layoutSurfaces() {
+    rail_->adjustSize();
+    QRect bounds = rail_->geometry();
+    for (auto *panel : {options_, advanced_})
+        if (!panel->isHidden())
+            bounds = bounds.united(panel->geometry());
+    setFixedSize(bounds.size());
+    updateSurfaceMask();
+}
+void ClipToolbar::updateSurfaceMask() {
+    QRegion region;
+    for (auto *surface : {rail_, options_, advanced_})
+        if (!surface->isHidden()) {
+            QPainterPath path;
+            path.addRoundedRect(QRectF(surface->geometry()), 6, 6);
+            region += QRegion(path.toFillPolygon().toPolygon());
+        }
+    setMask(region);
+    updateBackdrop();
+    update();
+}
+void ClipToolbar::updateBackdrop() {
+    if (!isVisible())
+        return;
+    QList<QRect> surfaces{rail_->geometry()};
+    for (auto *panel : {options_, advanced_})
+        if (!panel->isHidden())
+            surfaces << panel->geometry();
+    const bool visible = backdrop_->update(HWND(winId()), surfaces, devicePixelRatioF());
+    if (acrylic_ != visible) {
+        acrylic_ = visible;
+        update();
+    }
+}
+void ClipToolbar::hidePanel() {
+    panelMotion_->stop();
+    options_->hide();
+    advanced_->hide();
+    if (auto *combo = std::exchange(openCombo_, nullptr))
+        combo->hidePopup();
+    advancedPages_->setCurrentIndex(0);
+    if (openChoice_)
+        openChoice_->setChecked(false);
+    openChoice_ = nullptr;
+    layoutSurfaces();
+}
+void ClipToolbar::showOptions(ClipChoiceStack *choices, QPushButton *anchor, const QString &title) {
+    const bool close = options_->isVisible() && openChoice_ == anchor;
+    if (close) {
+        hidePanel();
+        return;
+    }
+    if (openChoice_)
+        openChoice_->setChecked(false);
+    const bool reveal = !options_->isVisible();
+    panelMotion_->stop();
+    if (auto *combo = std::exchange(openCombo_, nullptr))
+        combo->hidePopup();
+    advancedPages_->setCurrentIndex(0);
+    advanced_->hide();
+    optionTitle_->setText(title);
+    optionPages_->setFixedHeight(choices->height());
+    optionPages_->setCurrentWidget(choices);
+    placePanel(options_, anchor);
+    openChoice_ = anchor;
+    anchor->setChecked(true);
+    if (reveal) {
+        panelMotion_->setTargetObject(options_);
+        slideIn(options_, panelMotion_, 7);
+    }
+    choices->focusSelection();
+}
+void ClipToolbar::refreshChoices(int sourceHeight) {
+    formatStack_->populate({{"mp4", "MP4"}, {"mkv", "MKV"}, {"webm", "WebM"}, {"mov", "MOV"}});
+    QList<QPair<QVariant, QString>> rates;
+    for (int fps : {recorded_.fps, 60, 30, 15})
+        if (fps <= recorded_.fps)
+            rates.append({fps, QString("%1 fps").arg(fps)});
+    fpsStack_->populate(rates);
+    QList<QPair<QVariant, QString>> resolutions{
+        {0, sourceHeight > 0 ? QString("%1p").arg(sourceHeight) : QString("Source")}};
+    for (int height : {1080, 720, 480})
+        if (height < sourceHeight)
+            resolutions.append({height, QString("%1p").arg(height)});
+    resolutionStack_->populate(resolutions);
+    qualityStack_->populate({{"Maximum", "Maximum"}, {"High", "High"}, {"Balanced", "Balanced"},
+                            {"Compact", "Compact"}});
+    durationStack_->populate({{300, "5m"}, {180, "3m"}, {60, "1m"}, {30, "30s"}, {10, "10s"}});
+}
+void ClipToolbar::showDuration() {
+    const double buffered = pin_.duration();
+    const int requested = duration_->currentData().toInt();
+    const auto actual = durationText(qMin(double(requested), buffered));
+    available_->setText(QString("Available: %1\nThis clip: %2").arg(durationText(buffered), actual));
+    partial_->setText("Only " + actual);
+    partial_->setVisible(save_->isEnabled() && buffered < requested);
+    if (isVisible())
+        layoutSurfaces();
+    save_->setToolTip(pin_.id.isEmpty() ? "Start recording and buffer footage before saving"
+                      : !save_->isEnabled() ? "No verified encoder for this export format"
+                      : QString("Save %1 of %2 buffered, ending when the toolbar opened")
+                            .arg(actual, durationText(buffered)));
+}
 void ClipToolbar::open() {
-    application_ = foregroundApplication();
+    if (isVisible()) {
+        hide();
+        return;
+    }
     release();
     recorded_ = owner_->recorded_;
     auto stats = owner_->recorder_.stats();
@@ -1540,8 +2131,10 @@ void ClipToolbar::open() {
         } catch (const std::exception &e) {
             owner_->status_->setText(QString::fromUtf8(e.what()));
         }
-    record_->setText(stats.active ? "●  Stop Recording" : "Start Recording");
-    record_->setStyleSheet(stats.active ? "color:#ff9b9b" : "color:#87d7aa");
+    const auto recordAction = stats.active ? "Stop Recording" : "Start Recording";
+    record_->setIcon(hudIcon(stats.active ? QColor("#f39290") : QColor("#e2e9ef"), false, stats.active));
+    record_->setAccessibleName(recordAction);
+    record_->setToolTip(recordAction);
     fps_->clear();
     addChoice(fps_, QString("Source · %1 fps").arg(recorded_.fps), recorded_.fps);
     for (int f : {120, 60, 30, 15})
@@ -1569,42 +2162,70 @@ void ClipToolbar::open() {
             addChoice(encoder_, cap.codec + " · " + cap.name, cap.name, !recorded_.hdr || cap.hdr,
                       "No verified high-bit-depth HDR output for this implementation");
     selectValue(encoder_, recorded_.encoder);
-    selectValue(container_, recorded_.container);
-    available_->setText(QString("Available: %1\nThis clip: %2")
-                            .arg(durationText(pin_.duration()))
-                            .arg(durationText(qMin(30., pin_.duration()))));
-    save_->setEnabled(!pin_.id.isEmpty());
-    compress_->setEnabled(!pin_.id.isEmpty());
-    save_->setToolTip(pin_.id.isEmpty() ? "Start recording and buffer footage before saving"
-                                        : "Save the selected footage ending when this toolbar opened");
+    {
+        QSignalBlocker block(container_);
+        container_->clear();
+        for (auto name : {"mp4", "mkv", "webm", "mov"})
+            addChoice(container_, QString(name).toUpper(), name, !encoderForContainer(name).isEmpty(),
+                      "Requires a verified compatible export encoder");
+        selectValue(container_, recorded_.container);
+    }
+    const auto compatibleEncoder = encoderForContainer(container_->currentData().toString());
+    if (!compatibleEncoder.isEmpty())
+        selectValue(encoder_, compatibleEncoder);
+    save_->setEnabled(!pin_.id.isEmpty() && !compatibleEncoder.isEmpty());
+    compress_->setEnabled(save_->isEnabled());
+    compress_->setChecked(false);
+    mic_->setChecked(true);
+    desktop_->setChecked(true);
+    showDuration();
     auto screen = QGuiApplication::screenAt(QCursor::pos());
-    if (application_.window) {
-        auto *handle = QGuiApplication::screenAt(
-            QRect(GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), 1, 1).center());
-        Q_UNUSED(handle);
-        HMONITOR active = MonitorFromWindow(HWND(application_.window), MONITOR_DEFAULTTONEAREST);
-        MONITORINFO info{};
+    const auto foreground = GetForegroundWindow();
+    if (foreground) {
+        const HMONITOR active = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+        MONITORINFOEXW info{};
         info.cbSize = sizeof(info);
         if (GetMonitorInfoW(active, &info))
-            screen = QGuiApplication::screenAt(QPoint((info.rcMonitor.left + info.rcMonitor.right) / 2,
-                                                      (info.rcMonitor.top + info.rcMonitor.bottom) / 2));
+            for (auto *candidate : QGuiApplication::screens())
+                if (candidate->name().compare(QString::fromWCharArray(info.szDevice), Qt::CaseInsensitive) == 0) {
+                    screen = candidate;
+                    break;
+                }
     }
     if (!screen)
         screen = QGuiApplication::primaryScreen();
     auto area = screen->availableGeometry();
-    adjustSize();
-    move(area.left() + 16, area.top() + qMax(12, (area.height() - height()) / 2));
-    if (!excludeFromCapture(quintptr(winId()))) {
+    refreshChoices(stats.height);
+    layoutSurfaces();
+    move(area.left() + 12, area.top() + qMax(0, (area.height() - height()) / 2));
+    const auto handle = HWND(winId());
+    if (!excludeFromCapture(quintptr(handle))) {
         owner_->showError("Windows could not exclude the toolbar from monitor capture");
         release();
         return;
     }
+    dim_->setGeometry(screen->geometry());
+    if (excludeFromCapture(quintptr(dim_->winId()))) {
+        const bool animate = animateWindowsUi();
+        dim_->setWindowOpacity(animate ? .01 : .38);
+        dim_->show();
+        if (animate) {
+            dimMotion_->setStartValue(.01);
+            dimMotion_->setEndValue(.38);
+            dimMotion_->start();
+        }
+    }
     show();
-    raise();
+    SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     activateWindow();
+    if (dim_->isVisible())
+        SetWindowPos(HWND(dim_->winId()), handle, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    updateBackdrop();
+    slideIn(this, hudMotion_, 7);
     save_->setFocus();
 }
-void ClipToolbar::submit(bool compress) {
+void ClipToolbar::submit() {
     if (pin_.id.isEmpty())
         return;
     try {
@@ -1616,10 +2237,12 @@ void ClipToolbar::submit(bool compress) {
         output.height = resolution_->currentData().toInt();
         output.quality = quality_->currentText();
         output.encoder = encoder_->currentData().toString();
+        output.clipMic = mic_->isChecked();
+        output.clipDesktop = desktop_->isChecked();
         auto source = pin_;
         source.requested = duration_->currentData().toInt();
         source.start = qMax(source.start, source.end - source.requested);
-        owner_->exports_.submitSave(source, output, application_.name, application_.executable, compress);
+        owner_->exports_.submitSave(source, output, compress_->isChecked());
         pin_ = {};
         hide();
         owner_->status_->setText("Clip queued with fixed endpoint · " + durationText(source.duration()));
