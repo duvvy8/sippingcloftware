@@ -1,4 +1,5 @@
 #include "capture.h"
+#include "platform.h"
 #include <dxgi1_6.h>
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
@@ -23,8 +24,11 @@ struct Capture::Impl {
     GraphicsCaptureSession session{nullptr};
     IDirect3DDevice rtDevice{nullptr};
     bool floating = false, gotFrame = false;
-    std::atomic_bool closed = false;
+    std::shared_ptr<std::atomic_bool> closed = std::make_shared<std::atomic_bool>(false);
+    winrt::event_token closedToken{};
     QString backend;
+    HWND sourceWindow = nullptr;
+    HMONITOR sourceMonitor = nullptr;
     int width = 0, height = 0;
     double lastRead = 0, interval = 1. / 60;
     void read(ID3D11Texture2D *texture, CapturedFrame &out, int w, int h, double timestamp) {
@@ -64,6 +68,11 @@ void Capture::close() {
     if (!impl_)
         return;
     try {
+        if (impl_->item && impl_->closedToken.value)
+            impl_->item.Closed(impl_->closedToken);
+    } catch (...) {
+    }
+    try {
         if (impl_->session)
             impl_->session.Close();
         if (impl_->pool)
@@ -82,8 +91,13 @@ void Capture::open(const Settings &s, const Registry &r) {
             "DXGI captures displays only. Select Windows Graphics Capture for a window source.");
     if (r.displays.isEmpty())
         throw std::runtime_error("No attached capture display");
-    int index = qBound(0, s.monitor, int(r.displays.size()) - 1);
+    if (s.monitor < 0 || s.monitor >= r.displays.size())
+        throw std::runtime_error("Selected capture display is unavailable; choose a display explicitly");
+    int index = s.monitor;
     auto display = r.displays[index];
+    if (s.source == "monitor" && !s.monitorIdentity.isEmpty() && display.identity != s.monitorIdentity)
+        throw std::runtime_error(
+            "Selected display identity changed; refresh and reselect the capture display");
     if (s.source == "window" && s.window) {
         HMONITOR monitor = MonitorFromWindow(HWND(s.window), MONITOR_DEFAULTTONEAREST);
         for (auto d : r.displays)
@@ -91,6 +105,8 @@ void Capture::open(const Settings &s, const Registry &r) {
                 display = d;
     }
     auto &p = *impl_;
+    p.sourceWindow = s.source == "window" ? HWND(s.window) : nullptr;
+    p.sourceMonitor = HMONITOR(display.handle);
     p.floating = display.hdr || s.hdr;
     p.interval = 1. / qMax(1, s.fps);
     if (s.hdr && !display.hdr)
@@ -114,6 +130,13 @@ void Capture::open(const Settings &s, const Registry &r) {
             if (s.source == "window") {
                 if (!s.window || !IsWindow(HWND(s.window)))
                     throw std::runtime_error("Selected window no longer exists");
+                if (!s.windowExecutable.isEmpty()) {
+                    auto current = windowApplication(s.window);
+                    if (current.executable.compare(s.windowExecutable, Qt::CaseInsensitive) != 0 ||
+                        current.pid != s.windowPid || current.processCreated != s.windowProcessCreated)
+                        throw std::runtime_error(
+                            "Selected window process changed; reselect the capture window");
+                }
                 check_hresult(interop->CreateForWindow(HWND(s.window), guid_of<GraphicsCaptureItem>(),
                                                        put_abi(p.item)));
             } else
@@ -133,7 +156,7 @@ void Capture::open(const Settings &s, const Registry &r) {
                            : DirectXPixelFormat::B8G8R8A8UIntNormalized,
                 3, size);
             p.session = p.pool.CreateCaptureSession(p.item);
-            p.item.Closed([ptr = &p](auto &&, auto &&) { ptr->closed = true; });
+            p.closedToken = p.item.Closed([closed = p.closed](auto &&, auto &&) { closed->store(true); });
             p.session.StartCapture();
             p.backend = "Windows Graphics Capture";
             return;
@@ -155,7 +178,10 @@ void Capture::open(const Settings &s, const Registry &r) {
 }
 bool Capture::next(CapturedFrame &out) {
     auto &p = *impl_;
-    if (p.closed)
+    if (p.sourceWindow && MonitorFromWindow(p.sourceWindow, MONITOR_DEFAULTTONULL) != p.sourceMonitor)
+        throw std::runtime_error("Capture window moved to another display or closed. Capture stopped; review "
+                                 "the source and colour settings before restarting.");
+    if (p.closed->load())
         throw std::runtime_error("Capture source closed or disconnected");
     if (p.pool) {
         auto frame = p.pool.TryGetNextFrame();

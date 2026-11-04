@@ -10,7 +10,7 @@ struct RecordingStats {
     quint64 captured = 0, encoded = 0, dropped = 0, audioDiscontinuities = 0;
     int backlog = 0, width = 0, height = 0, fps = 0;
     qint64 bytes = 0;
-    QString encoder, backend, error;
+    QString encoder, backend, error, audioNotice;
     QJsonObject json() const;
 };
 class Recorder {

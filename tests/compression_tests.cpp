@@ -177,6 +177,79 @@ class CompressionTests : public QObject {
         QVERIFY(!score.passed());
         QVERIFY(score.frames >= 208);
     }
+    void hdrCompressionAndIdenticalScoringTransform() {
+        auto original = tmp_.filePath("hdr-original.mp4");
+        auto generated = clip::runProcess(
+            clip::ffmpegPath(),
+            {"-v",
+             "error",
+             "-y",
+             "-i",
+             source_,
+             "-t",
+             "2",
+             "-vf",
+             "zscale=tin=709:min=709:pin=709:rin=limited:t=smpte2084:p=2020:m=2020_ncl:r=limited",
+             "-pix_fmt",
+             "yuv420p10le",
+             "-c:v",
+             "libx265",
+             "-preset",
+             "ultrafast",
+             "-crf",
+             "10",
+             "-x265-params",
+             "master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll="
+             "1000,400:repeat-headers=1:pools=1:frame-threads=1",
+             "-color_primaries",
+             "bt2020",
+             "-color_trc",
+             "smpte2084",
+             "-colorspace",
+             "bt2020nc",
+             "-color_range",
+             "tv",
+             "-c:a",
+             "aac",
+             original},
+            30000);
+        QVERIFY2(generated.code == 0, generated.output.constData());
+        auto reference = clip::inspect(original, true);
+        QVERIFY(reference.hdr && !reference.hdrMetadata.isEmpty());
+        auto identical = clip::scoreMedia(original, original, reference);
+        QVERIFY(identical.passed());
+        QFile file(original);
+        QVERIFY(file.open(QIODevice::ReadWrite));
+        QVERIFY(file.resize(clip::SizeLimit + 1));
+        file.close();
+        auto before = digest(original);
+        auto result = clip::compressMedia(original, tmp_.filePath("hdr-compressed.mp4"), "libx265");
+        QVERIFY2(result.state == "Compressed", qPrintable(result.state + ": " + result.reason));
+        QVERIFY(result.media.hdr);
+        QCOMPARE(result.media.codecId, int(AV_CODEC_ID_HEVC));
+        QCOMPARE(result.media.hdrMetadata, reference.hdrMetadata);
+        QCOMPARE(result.media.audioPayloadHashes, reference.audioPayloadHashes);
+        QVERIFY(result.quality.passed());
+        QCOMPARE(digest(original), before);
+    }
+    void anamorphicDisplayAspectPreserved() {
+        auto original = tmp_.filePath("anamorphic.mp4");
+        auto generated =
+            clip::runProcess(clip::ffmpegPath(),
+                             {"-v", "error", "-y", "-i", source_, "-t", "2", "-vf", "setsar=4/3", "-c:v",
+                              "libx264", "-preset", "ultrafast", "-c:a", "copy", original},
+                             30000);
+        QVERIFY2(generated.code == 0, generated.output.constData());
+        auto reference = clip::inspect(original);
+        QVERIFY(qAbs(reference.displayAspect - 64. / 27) < .001);
+        QFile file(original);
+        QVERIFY(file.open(QIODevice::ReadWrite));
+        QVERIFY(file.resize(clip::SizeLimit + 1));
+        file.close();
+        auto result = clip::compressMedia(original, tmp_.filePath("anamorphic-compressed.mp4"), "libx264");
+        QVERIFY2(result.state == "Compressed", qPrintable(result.reason));
+        QVERIFY(qAbs(result.media.displayAspect - reference.displayAspect) < .001);
+    }
     void cancellationRetainsOriginal() {
         std::atomic_bool cancel = true;
         auto before = digest(source_);

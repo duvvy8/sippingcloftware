@@ -39,6 +39,7 @@ ProcessResult runProcess(const QString &program, const QStringList &args, int ti
                          const QString &workingDirectory = {});
 struct AudioSource {
     QString id, name, kind = "system";
+    QString processExecutable, processCreated;
     quint32 pid = 0;
     bool enabled = true, mute = false, separate = false, mix = true, pushToTalk = false;
     double gain = 1.;
@@ -47,6 +48,8 @@ struct AudioSource {
     static AudioSource fromJson(const QJsonObject &);
 };
 struct Settings {
+    QString monitorIdentity, windowExecutable, windowProcessCreated;
+    quint32 windowPid = 0;
     QString library, bufferFolder, encoder = "auto", backend = "wgc", source = "monitor", container = "mp4",
                                    quality = "High";
     int monitor = 0, fps = 60, height = 0, retention = 300;
@@ -62,4 +65,6 @@ struct Settings {
     void loadObject(const QJsonObject &);
     bool save() const;
 };
+QJsonObject captureSettings(const Settings &);
+QString captureProfileKey(const Settings &);
 } // namespace clip

@@ -14,9 +14,9 @@ This is an evidence log, not a completed-release claim. See the requirement IDs 
 
 ## Build and core tests
 
-`scripts/build.ps1 -DependencyRoot ../frame/.deps` produces a native Release build,
+`scripts/build.ps1` produces a native Release build using repository `.deps`,
 stages Qt and FFmpeg DLLs, executables and fonts, and runs CTest. The dependency
-root is an explicit local cache for this session; the default is repository `.deps`.
+root can also be supplied explicitly with `-DependencyRoot`.
 
 The latest completed core test run passes filename sanitization (including Unicode
 and DOS reserved names), atomic JSON persistence, monotonic clock, catalogue
@@ -28,8 +28,8 @@ have an explicit 120-second timeout.
 
 ## Encoder discovery (H01–H09)
 
-An isolated runtime probe enumerated 120 suitable video encoder implementations;
-48 produced packets from synthetic 640×360, 60 fps input. These counts describe
+Initial discovery included 120 candidates; further image filtering leaves 101 video
+implementations, 46 of which produced synthetic output on this host. These counts describe
 this distributed FFmpeg build and this host, not general hardware support.
 
 - NVIDIA H.264, HEVC and AV1: initialized and emitted synthetic packets.
@@ -96,9 +96,10 @@ overlay placement/exclusion over a game remains unverified.
 
 ## Release gates still open
 
-Remaining capture/audio reliability, full toolbar-save integration, compression and VMAF,
-clipboard, interactive persistent notifications, resource/game performance,
-installer and installed-app verification are unfinished. The goal remains active.
+Remaining capture/audio reliability matrix, wider codec controls/configurations,
+representative gaming quality and resource/game performance, destination paste,
+native popup presentation, installer and installed-app verification remain open.
+The goal remains active.
 
 ## Editing milestone
 
@@ -194,3 +195,45 @@ return ERROR_NOT_FOUND before an app's first toast; the app permits submission i
 that specific case and preserves other errors. API submission is not represented as
 proof that Windows presented a popup.
 
+
+## Capture and source reliability milestone, 2026-11-04
+
+All seven CTest targets pass: core 23 checks, media 9, compression 16,
+notification/actions 14 passed with the same explicit native-delivery skip,
+and native UI 13 each at 100%, 150% and 200%. The current Release build has no
+MSVC compiler warnings in its latest build log.
+
+Stable monitor interface identity takes precedence over a saved enumeration index.
+Missing displays stay unavailable instead of selecting a different screen. Windows
+must be explicitly reselected after app restart; current PID/executable/process
+creation identity is checked before capture. Audio process sources retain the same
+identity, detect parent/child route overlap and stop if the process exits.
+Native process identity/ancestry, stale identity, missing-source and saved-settings
+cases pass. Physical monitor reconnection and Windows 11 process loopback remain
+untested.
+
+WASAPI endpoint notifications are registered on a dedicated MTA thread. Native
+callbacks compare immutable opaque IDs and set atomic flags only. Default endpoint
+changes disclose continued use of the selected device; device removal invalidates
+capture, and a reconnect does not silently resume it. The event-policy tests pass.
+A new real 3-second WGC/NVENC/system-audio save has two fully decoded AAC tracks,
+zero dropped frames/backlog/discontinuities and an unchanged endpoint. Physical
+unplugging and changing the user's default devices were not performed.
+
+The native UI tests now capture a real changing window, open the toolbar, delay
+selection, save through its button, and destroy the source window. Capture stops
+with an explicit error while the previously selected interval saves and fully
+validates. Both fixed endpoint and duration tolerance are checked at all scales.
+The WGC Closed callback uses revocation and shared state to avoid a dangling
+capture-object pointer during teardown.
+
+Live restart tests confirm No retains the running 30fps capture and epoch, while
+Yes restarts at the explicitly selected 15fps. Actual capture-path calibration
+writes on the selected replay drive, decodes each completed segment, and keys the
+recommendation to source identity/geometry, audio, recording settings and storage
+path. A matching automatic configuration starts; changing its profile is refused.
+
+Additional compression tests pass for synthetic HDR HEVC/MP4 with mastering/CLL
+metadata and exact retained audio packet payloads, identical controlled SDR scoring
+transforms, and anamorphic display-aspect preservation. These verify software
+pipelines, not real HDR monitor capture or gaming visual quality.

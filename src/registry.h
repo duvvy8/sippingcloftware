@@ -8,7 +8,7 @@ struct Adapter {
     QJsonObject json() const;
 };
 struct Display {
-    QString name;
+    QString name, identity;
     quintptr handle = 0;
     int width = 0, height = 0, adapter = 0, output = 0;
     double refresh = 0;

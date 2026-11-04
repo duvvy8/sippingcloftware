@@ -204,6 +204,7 @@ QJsonObject RecordingStats::json() const {
             {"encoded", qint64(encoded)},
             {"dropped", qint64(dropped)},
             {"audioDiscontinuities", qint64(audioDiscontinuities)},
+            {"audioNotice", audioNotice},
             {"backlog", backlog},
             {"width", width},
             {"height", height},
@@ -428,6 +429,7 @@ void Recorder::run(Settings s, Registry registry) {
                 stats_.encoded = quint64(totalFrames);
                 stats_.backlog = qMax(0, int(lag * s.fps));
                 stats_.audioDiscontinuities = audio.discontinuities();
+                stats_.audioNotice = audio.notice();
             }
             if (writer->frames >= s.fps * 2)
                 commit();

@@ -4,7 +4,57 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
+#include <tlhelp32.h>
 namespace clip {
+QJsonObject processIdentity(quint32 pid) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process)
+        return {};
+    auto close = qScopeGuard([&] { CloseHandle(process); });
+    std::wstring path(32768, L'\0');
+    DWORD length = DWORD(path.size()), exit = 0;
+    FILETIME created{}, ended{}, kernel{}, user{};
+    if (!QueryFullProcessImageNameW(process, 0, path.data(), &length) ||
+        !GetProcessTimes(process, &created, &ended, &kernel, &user) || !GetExitCodeProcess(process, &exit) ||
+        exit != STILL_ACTIVE)
+        return {};
+    return {{"pid", qint64(pid)},
+            {"executable", QString::fromWCharArray(path.data(), int(length))},
+            {"created", QString::number((quint64(created.dwHighDateTime) << 32) | created.dwLowDateTime)}};
+}
+bool processTreeContains(quint32 ancestor, quint32 process) {
+    if (!ancestor || !process)
+        return false;
+    if (ancestor == process)
+        return true;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+        throw std::runtime_error("Cannot check overlapping application audio process trees");
+    auto close = qScopeGuard([&] { CloseHandle(snapshot); });
+    QMap<quint32, quint32> parents;
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot, &entry))
+        do {
+            parents[entry.th32ProcessID] = entry.th32ParentProcessID;
+        } while (Process32NextW(snapshot, &entry));
+    QSet<quint32> visited;
+    while (parents.contains(process) && !visited.contains(process)) {
+        visited.insert(process);
+        auto parent = parents[process];
+        if (!parent || parent == process)
+            return false;
+        const auto childIdentity = processIdentity(process), parentIdentity = processIdentity(parent);
+        if (!childIdentity.isEmpty() && !parentIdentity.isEmpty() &&
+            parentIdentity["created"].toString().toULongLong() >
+                childIdentity["created"].toString().toULongLong())
+            return false;
+        if (parent == ancestor)
+            return true;
+        process = parent;
+    }
+    return false;
+}
 ApplicationIdentity windowApplication(quintptr value) {
     ApplicationIdentity result;
     HWND window = HWND(value);
@@ -14,6 +64,9 @@ ApplicationIdentity windowApplication(quintptr value) {
     GetWindowThreadProcessId(window, &pid);
     if (pid == GetCurrentProcessId())
         return result;
+    const auto identity = processIdentity(pid);
+    result.pid = pid;
+    result.processCreated = identity["created"].toString();
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (process) {
         std::wstring path(32768, L'\0');

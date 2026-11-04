@@ -1,4 +1,7 @@
 #include "audio.h"
+#include "platform.h"
+#include "audio_events.h"
+#include <condition_variable>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <audioclientactivationparams.h>
@@ -33,6 +36,34 @@ struct Activation
         return S_OK;
     }
 };
+class DeviceNotifications final
+    : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+                                          Microsoft::WRL::FtmBase, IMMNotificationClient> {
+    std::shared_ptr<AudioDeviceEvents> events_;
+
+  public:
+    explicit DeviceNotifications(std::shared_ptr<AudioDeviceEvents> events) : events_(std::move(events)) {}
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR) override {
+        if (role == eConsole && (flow == eRender || flow == eCapture))
+            events_->defaultChanged(flow == eCapture);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR id, DWORD state) override {
+        events_->deviceState(id, state == DEVICE_STATE_ACTIVE);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override {
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR id) override {
+        events_->deviceState(id, false);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR id, const PROPERTYKEY) override {
+        events_->propertiesChanged(id);
+        return S_OK;
+    }
+};
 struct Source {
     AudioSource config;
     std::thread worker;
@@ -45,6 +76,11 @@ struct Source {
     void run() {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         try {
+            HANDLE targetProcess = nullptr;
+            auto releaseProcess = qScopeGuard([&] {
+                if (targetProcess)
+                    CloseHandle(targetProcess);
+            });
             ComPtr<IAudioClient> client;
             WAVEFORMATEX *allocated = nullptr;
             WAVEFORMATEX processFormat{};
@@ -55,6 +91,15 @@ struct Source {
                     throw std::runtime_error(
                         "Per-application audio requires Windows build 20348 or later. Select labelled "
                         "system/device capture on this Windows version.");
+                targetProcess =
+                    OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, config.pid);
+                FILETIME created{}, exited{}, kernel{}, user{};
+                if (!targetProcess || !GetProcessTimes(targetProcess, &created, &exited, &kernel, &user) ||
+                    QString::number((quint64(created.dwHighDateTime) << 32) | created.dwLowDateTime) !=
+                        config.processCreated ||
+                    WaitForSingleObject(targetProcess, 0) != WAIT_TIMEOUT)
+                    throw std::runtime_error(
+                        "Selected application process ended or changed; reselect application audio");
                 auto completion = Microsoft::WRL::Make<Activation>();
                 AUDIOCLIENT_ACTIVATION_PARAMS params{};
                 params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
@@ -128,6 +173,9 @@ struct Source {
             double expected = 0;
             int sinceDrift = 0;
             while (!stop) {
+                if (targetProcess && WaitForSingleObject(targetProcess, 0) != WAIT_TIMEOUT)
+                    throw std::runtime_error(
+                        "Selected application audio process ended; capture stopped without replacing it");
                 UINT32 frames = 0;
                 hrcheck(capture->GetNextPacketSize(&frames), "Audio device disconnected");
                 if (!frames) {
@@ -201,6 +249,57 @@ struct Source {
 } // namespace
 struct AudioEngine::Impl {
     std::vector<std::unique_ptr<Source>> sources;
+    std::shared_ptr<AudioDeviceEvents> deviceEvents;
+    std::thread monitor;
+    std::atomic_bool monitorReady = false, monitorStop = false;
+    std::condition_variable monitorWake;
+    std::mutex monitorMutex;
+    QString monitorError;
+    void observe(const QList<AudioSource> &configs) {
+        bool hasDevice = false;
+        for (const auto &source : configs)
+            hasDevice |= source.enabled && source.kind != "application";
+        if (!hasDevice)
+            return;
+        deviceEvents = std::make_shared<AudioDeviceEvents>(configs);
+        monitorReady = false;
+        monitorStop = false;
+        monitorError.clear();
+        monitor = std::thread([this] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            auto uninit = qScopeGuard([&] {
+                if (SUCCEEDED(apartment))
+                    CoUninitialize();
+            });
+            try {
+                hrcheck(apartment, "Initialize audio device event monitor");
+                ComPtr<IMMDeviceEnumerator> enumerator;
+                hrcheck(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                         IID_PPV_ARGS(&enumerator)),
+                        "Create audio device event monitor");
+                auto callback = Microsoft::WRL::Make<DeviceNotifications>(deviceEvents);
+                hrcheck(enumerator->RegisterEndpointNotificationCallback(callback.Get()),
+                        "Monitor selected audio device changes");
+                auto unregister =
+                    qScopeGuard([&] { enumerator->UnregisterEndpointNotificationCallback(callback.Get()); });
+                monitorReady = true;
+                std::unique_lock lock(monitorMutex);
+                monitorWake.wait(lock, [&] { return monitorStop.load(); });
+            } catch (const std::exception &e) {
+                monitorError = QString::fromUtf8(e.what());
+                monitorReady = true;
+            }
+        });
+        QElapsedTimer timer;
+        timer.start();
+        while (!monitorReady && timer.elapsed() < 5000)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!monitorReady)
+            throw std::runtime_error("Audio device event monitor initialization timed out");
+        if (!monitorError.isEmpty())
+            throw std::runtime_error(monitorError.toStdString());
+    }
 };
 AudioEngine::AudioEngine() : impl_(std::make_unique<Impl>()) {}
 AudioEngine::~AudioEngine() {
@@ -260,21 +359,49 @@ bool AudioEngine::processCaptureSupported() {
     auto fn = reinterpret_cast<Version>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
     return fn && fn(&v) == 0 && v.dwBuildNumber >= 20348;
 }
-void AudioEngine::start(const QList<AudioSource> &configs) {
-    stop();
+void AudioEngine::validateSources(const QList<AudioSource> &configs) {
     bool system = false, application = false;
     QSet<QString> ids;
+    QList<AudioSource> applications;
     for (auto c : configs)
         if (c.enabled) {
-            if (ids.contains(c.id + QString::number(c.pid)))
+            QString identityKey =
+                c.kind == "application" ? "application/" + QString::number(c.pid) : "device/" + c.id;
+            if (ids.contains(identityKey))
                 throw std::runtime_error("The same audio source was selected twice");
-            ids.insert(c.id + QString::number(c.pid));
+            ids.insert(identityKey);
             system |= c.kind == "system";
             application |= c.kind == "application";
+            if (c.kind == "application") {
+                auto identity = processIdentity(c.pid);
+                if (c.processCreated.isEmpty() || c.processExecutable.isEmpty() ||
+                    identity["created"].toString() != c.processCreated ||
+                    identity["executable"].toString().compare(c.processExecutable, Qt::CaseInsensitive) != 0)
+                    throw std::runtime_error("Application audio process is missing, restarted or changed. "
+                                             "Reselect it; no replacement was captured.");
+                applications << c;
+            }
         }
     if (system && application)
         throw std::runtime_error("System output and per-application audio overlap. Disable one route to "
                                  "avoid recording the same sound twice.");
+    for (int a = 0; a < applications.size(); ++a)
+        for (int b = a + 1; b < applications.size(); ++b)
+            if (processTreeContains(applications[a].pid, applications[b].pid) ||
+                processTreeContains(applications[b].pid, applications[a].pid))
+                throw std::runtime_error(
+                    "Selected application audio routes contain overlapping parent/child processes. Keep one "
+                    "process-tree route to avoid recording sound twice.");
+}
+void AudioEngine::start(const QList<AudioSource> &configs) {
+    stop();
+    validateSources(configs);
+    try {
+        impl_->observe(configs);
+    } catch (...) {
+        stop();
+        throw;
+    }
     for (auto c : configs)
         if (c.enabled) {
             auto s = std::make_unique<Source>();
@@ -296,10 +423,18 @@ void AudioEngine::start(const QList<AudioSource> &configs) {
 void AudioEngine::stop() {
     for (auto &s : impl_->sources)
         s->stop = true;
+    {
+        std::lock_guard lock(impl_->monitorMutex);
+        impl_->monitorStop = true;
+    }
+    impl_->monitorWake.notify_all();
+    if (impl_->monitor.joinable())
+        impl_->monitor.join();
     for (auto &s : impl_->sources)
         if (s->worker.joinable())
             s->worker.join();
     impl_->sources.clear();
+    impl_->deviceEvents.reset();
 }
 int AudioEngine::tracks() const {
     if (impl_->sources.empty())
@@ -311,12 +446,17 @@ int AudioEngine::tracks() const {
     return n;
 }
 QString AudioEngine::error() const {
+    if (impl_->deviceEvents && !impl_->deviceEvents->error().isEmpty())
+        return impl_->deviceEvents->error();
     for (auto &s : impl_->sources) {
         std::lock_guard lock(s->mutex);
         if (!s->error.isEmpty())
             return s->config.name + ": " + s->error;
     }
     return {};
+}
+QString AudioEngine::notice() const {
+    return impl_->deviceEvents ? impl_->deviceEvents->notice() : QString();
 }
 quint64 AudioEngine::discontinuities() const {
     quint64 n = 0;

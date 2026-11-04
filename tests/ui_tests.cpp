@@ -8,6 +8,7 @@ class UiTests : public QObject {
     QTemporaryDir temporary_;
     std::unique_ptr<MainWindow> window_;
     QString sample_;
+    QString expectedDisplay_;
   private slots:
     void initTestCase() {
         qputenv("CLIPPER_STATE_DIR", temporary_.path().toUtf8());
@@ -18,12 +19,20 @@ class UiTests : public QObject {
         settings.bufferFolder = temporary_.filePath("buffer");
         settings.overlayHotkey = "Ctrl+Alt+Shift+F21";
         settings.recordHotkey = "Ctrl+Alt+Shift+F22";
+        Registry hardware;
+        hardware.discover();
+        QVERIFY(!hardware.displays.isEmpty());
+        expectedDisplay_ = hardware.displays.last().identity;
+        settings.monitorIdentity = expectedDisplay_;
+        settings.monitor = 0; // Deliberately stale enumeration index; identity must win.
         QVERIFY(settings.save());
         window_ = std::make_unique<MainWindow>();
         window_->show();
         QTest::qWait(100);
     }
     void navigationAndFonts() {
+        QCOMPARE(window_->readRecording().monitorIdentity, expectedDisplay_);
+        QCOMPARE(window_->windows_->currentData().toULongLong(), qulonglong(0));
         QVERIFY(QFontInfo(QApplication::font()).family().contains("Inter"));
         QCOMPARE(window_->tabs_->count(), 3);
         for (int i = 0; i < 3; ++i) {
@@ -191,6 +200,144 @@ class UiTests : public QObject {
         QCOMPARE(fileIdentity(original), identity);
         QVERIFY(QFileInfo::exists(job.output));
     }
+    void realWindowCaptureToolbarSaveAndSourceClosure() {
+        auto fixture = std::make_unique<QLabel>("Live capture verification");
+        fixture->setWindowTitle("Capture verification");
+        fixture->setMinimumSize(640, 360);
+        fixture->setAlignment(Qt::AlignCenter);
+        fixture->show();
+        QVERIFY(QTest::qWaitForWindowExposed(fixture.get()));
+        QTimer movement;
+        int frame = 0;
+        connect(&movement, &QTimer::timeout, fixture.get(),
+                [&] { fixture->setText(QString("HUD 0123456789 · frame %1").arg(++frame)); });
+        movement.start(16);
+        auto settings = window_->readRecording();
+        settings.source = "window";
+        settings.window = quintptr(fixture->winId());
+        settings.windowExecutable.clear();
+        settings.windowProcessCreated.clear();
+        settings.windowPid = 0;
+        settings.encoder = "libx264";
+        settings.fps = 30;
+        settings.height = 360;
+        settings.backend = "wgc";
+        settings.hdr = false;
+        settings.audio.clear();
+        settings.bufferFolder = temporary_.filePath("real-capture-buffer");
+        HMONITOR monitor = MonitorFromWindow(HWND(settings.window), MONITOR_DEFAULTTONEAREST);
+        for (int i = 0; i < window_->registry_.displays.size(); ++i)
+            if (window_->registry_.displays[i].handle == quintptr(monitor)) {
+                settings.monitor = i;
+                settings.monitorIdentity = window_->registry_.displays[i].identity;
+            }
+        window_->recorded_ = settings;
+        window_->recorder_.start(settings, window_->registry_);
+        auto stop = qScopeGuard([&] {
+            movement.stop();
+            window_->recorder_.stop();
+        });
+        QTest::qWait(2300);
+        window_->toolbar_->open();
+        QVERIFY(window_->toolbar_->isVisible());
+        QVERIFY(window_->toolbar_->save_->isEnabled());
+        double endpoint = window_->toolbar_->endpoint_;
+        QTest::qWait(300);
+        QTest::mouseClick(window_->toolbar_->save_, Qt::LeftButton);
+        QVERIFY(!window_->toolbar_->isVisible());
+        QCOMPARE(window_->toolbar_->pin_.id, QString());
+        QTest::qWait(200);
+        movement.stop();
+        fixture.reset();
+        QTRY_VERIFY_WITH_TIMEOUT(!window_->recorder_.active(), 5000);
+        QVERIFY(window_->recorder_.stats().error.contains("closed", Qt::CaseInsensitive));
+        QTRY_VERIFY_WITH_TIMEOUT(window_->exports_.jobs().last().kind == "save" &&
+                                     window_->exports_.jobs().last().terminal,
+                                 30000);
+        auto job = window_->exports_.jobs().last();
+        QVERIFY2(job.state == "Complete", qPrintable(job.message));
+        QCOMPARE(job.source.end, endpoint);
+        auto media = inspect(job.original);
+        QVERIFY(qAbs(media.duration - job.source.duration()) <= 1. / media.fps + .001);
+        QVERIFY(decodeValidate(job.original));
+        QVERIFY(window_->recorder_.stats().backlog == 0);
+        window_->recorder_.stop();
+        window_->recorder_.buffer().clear();
+    }
+    void restartApprovalAndCaptureCalibration() {
+        window_->populateEncoders();
+        window_->encoder_->setCurrentIndex(window_->encoder_->findData("libx264"));
+        window_->source_->setCurrentIndex(window_->source_->findData("monitor"));
+        window_->recordFps_->setCurrentIndex(window_->recordFps_->findData(30));
+        window_->recordHeight_->setCurrentIndex(window_->recordHeight_->findData(480));
+        auto settings = window_->readRecording();
+        window_->recorded_ = settings;
+        window_->recorder_.start(settings, window_->registry_);
+        auto stop = qScopeGuard([&] { window_->recorder_.stop(); });
+        QTest::qWait(250);
+        auto initial = window_->recorder_.stats();
+        window_->recordFps_->setCurrentIndex(window_->recordFps_->findData(15));
+        QTimer response;
+        response.setInterval(10);
+        bool asked = false;
+        QString question;
+        QMessageBox::StandardButton answer = QMessageBox::No;
+        connect(&response, &QTimer::timeout, this, [&] {
+            if (auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget())) {
+                asked = true;
+                question = box->text();
+                response.stop();
+                if (auto *button = box->button(answer))
+                    QTest::mouseClick(button, Qt::LeftButton);
+                else
+                    box->reject();
+            }
+        });
+        response.start();
+        window_->applyRecording();
+        response.stop();
+        QVERIFY(asked && question.contains("clears the replay buffer"));
+        QVERIFY(window_->recorder_.active());
+        QCOMPARE(window_->recorder_.stats().fps, 30);
+        QCOMPARE(window_->recorder_.stats().started, initial.started);
+        asked = false;
+        answer = QMessageBox::Yes;
+        response.start();
+        window_->applyRecording();
+        response.stop();
+        QVERIFY(asked && question.contains("clears the replay buffer"));
+        QVERIFY(window_->recorder_.active());
+        QCOMPARE(window_->recorder_.stats().fps, 15);
+        QVERIFY(window_->recorder_.stats().started > initial.started);
+        window_->toggleRecording();
+        QVERIFY(!window_->recorder_.active());
+        window_->recorder_.buffer().clear();
+        window_->calibrate();
+        QTRY_VERIFY_WITH_TIMEOUT(!window_->discovery_, 30000);
+        const auto *cap = window_->registry_.find("libx264");
+        QVERIFY(cap && cap->live);
+        bool matched = false;
+        for (auto value : cap->tested)
+            matched |=
+                value.toObject()["sourceKey"].toString() == captureProfileKey(window_->readRecording());
+        QVERIFY(matched);
+        window_->encoder_->setCurrentIndex(window_->encoder_->findData("auto"));
+        window_->toggleRecording();
+        QVERIFY(window_->recorder_.active());
+        QCOMPARE(window_->recorder_.stats().encoder, QString("libx264"));
+        QCOMPARE(window_->recorder_.stats().fps, 15);
+        QTest::qWait(150);
+        window_->toggleRecording();
+        window_->recorder_.buffer().clear();
+        window_->recordFps_->setCurrentIndex(window_->recordFps_->findData(30));
+        asked = false;
+        answer = QMessageBox::Ok;
+        response.start();
+        window_->toggleRecording();
+        response.stop();
+        QVERIFY(asked && question.contains("profile changed"));
+        QVERIFY(!window_->recorder_.active());
+    }
     void externalRenameRecovery() {
         auto original = fileIdentity(sample_);
         QString renamed = QFileInfo(sample_).dir().filePath("renamed.mp4");
@@ -210,6 +357,23 @@ class UiTests : public QObject {
         window_->close();
         QVERIFY(!window_->isVisible());
         QVERIFY(!window_->recorder_.active());
+    }
+    void missingSourcesDoNotSelectReplacements() {
+        window_.reset();
+        Settings settings;
+        settings.load();
+        settings.monitorIdentity = "missing-monitor-interface";
+        settings.source = "window";
+        settings.windowExecutable = "C:/Previous/game.exe";
+        settings.autoRecord = true;
+        QVERIFY(settings.save());
+        window_ = std::make_unique<MainWindow>(true);
+        QCOMPARE(window_->display_->currentData().toInt(), -1);
+        QCOMPARE(window_->windows_->currentData().toULongLong(), qulonglong(0));
+        QVERIFY(!window_->recorder_.active());
+        window_->refreshCaptureSources();
+        QCOMPARE(window_->display_->currentData().toInt(), -1);
+        QCOMPARE(window_->windows_->currentData().toULongLong(), qulonglong(0));
     }
     void cleanupTestCase() {
         window_.reset();

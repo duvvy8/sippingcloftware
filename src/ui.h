@@ -68,6 +68,7 @@ class MainWindow : public QMainWindow {
     QWidget *settingsPage();
     void populateEncoders();
     void refreshSources();
+    void refreshCaptureSources();
     void refreshLibrary();
     void fillLibrary();
     void selectClip();

@@ -45,13 +45,32 @@ void selectValue(QComboBox *b, const QVariant &v) {
     if (index >= 0)
         b->setCurrentIndex(index);
 }
-QJsonObject captureSettings(const Settings &s) {
-    auto result = s.json();
-    for (const auto &key : {"library", "container", "folders", "startup", "autoRecord", "notifications",
-                            "overlayHotkey", "recordHotkey", "pttHotkey"})
-        result.remove(key);
-    result["window"] = qint64(s.window);
-    return result;
+void populateDisplays(QComboBox *box, const QList<Display> &displays, const QString &identity,
+                      int legacyIndex) {
+    QSignalBlocker blocker(box);
+    box->clear();
+    int selected = -1;
+    for (int i = 0; i < displays.size(); ++i) {
+        const auto &d = displays[i];
+        box->addItem(QString("%1 · %2 × %3 · %4 Hz%5")
+                         .arg(d.name)
+                         .arg(d.width)
+                         .arg(d.height)
+                         .arg(d.refresh)
+                         .arg(d.hdr ? " · HDR" : ""),
+                     i);
+        box->setItemData(i, d.identity, Qt::UserRole + 1);
+        if ((!identity.isEmpty() && d.identity == identity) || (identity.isEmpty() && i == legacyIndex))
+            selected = i;
+    }
+    if (selected < 0) {
+        addChoice(
+            box, "Selected display unavailable · refresh or reselect", -1, false,
+            "The previous display was not found. A different display will not be selected automatically.");
+        selected = box->count() - 1;
+        box->setItemData(selected, identity, Qt::UserRole + 1);
+    }
+    box->setCurrentIndex(selected);
 }
 } // namespace
 void applyAppearance(QApplication &app) {
@@ -387,6 +406,7 @@ QWidget *MainWindow::recordingPage() {
     button("Open Toolbar", top, [this] { toolbar_->open(); });
     button("Test Encoders", top, [this] { probeEncoders(); });
     button("Calibrate Capture", top, [this] { calibrate(); });
+    button("Refresh sources", top, [this] { refreshCaptureSources(); });
     v->addLayout(top);
     recordStats_ = new QLabel;
     recordStats_->setWordWrap(true);
@@ -402,17 +422,7 @@ QWidget *MainWindow::recordingPage() {
     source_->addItem("Window", "window");
     selectValue(source_, settings_.source);
     display_ = new QComboBox;
-    for (int i = 0; i < registry_.displays.size(); ++i) {
-        auto &d = registry_.displays[i];
-        display_->addItem(QString("%1 · %2 × %3 · %4 Hz%5")
-                              .arg(d.name)
-                              .arg(d.width)
-                              .arg(d.height)
-                              .arg(d.refresh)
-                              .arg(d.hdr ? " · HDR" : ""),
-                          i);
-    }
-    selectValue(display_, settings_.monitor);
+    populateDisplays(display_, registry_.displays, settings_.monitorIdentity, settings_.monitor);
     windows_ = new QComboBox;
     backend_ = new QComboBox;
     backend_->addItem("Windows Graphics Capture (DXGI monitor fallback)", "wgc");
@@ -499,6 +509,14 @@ QWidget *MainWindow::recordingPage() {
             a.pid = quint32(pid);
             a.id = "process:" + QString::number(pid);
             a.name = "Process " + QString::number(pid);
+            auto identity = processIdentity(a.pid);
+            if (identity.isEmpty()) {
+                showError("This application process is unavailable or cannot be identified");
+                return;
+            }
+            a.processCreated = identity["created"].toString();
+            a.processExecutable = identity["executable"].toString();
+            a.name = QFileInfo(a.processExecutable).completeBaseName() + " · " + QString::number(a.pid);
         } else {
             auto d = devices[index];
             a.id = d.id;
@@ -756,10 +774,26 @@ bool MainWindow::approveSdrRecording(Settings &s) {
 }
 void MainWindow::refreshSources() {
     auto previous = windows_->currentData();
+    auto previousIdentity = windows_->currentData(Qt::UserRole + 1).toJsonObject();
+    QSignalBlocker blocker(windows_);
     windows_->clear();
-    for (auto pair : captureWindows())
+    addChoice(
+        windows_,
+        settings_.windowExecutable.isEmpty()
+            ? "Select a capture window"
+            : "Reselect window · " + QFileInfo(settings_.windowExecutable).completeBaseName(),
+        qulonglong(0), false,
+        "Window handles are not reused after restarting the app; choose the intended window explicitly.");
+    for (auto pair : captureWindows()) {
+        auto identity = windowApplication(pair.first);
         windows_->addItem(pair.second, QVariant::fromValue(qulonglong(pair.first)));
-    selectValue(windows_, previous);
+        QJsonObject value{{"executable", identity.executable},
+                          {"pid", qint64(identity.pid)},
+                          {"created", identity.processCreated}};
+        windows_->setItemData(windows_->count() - 1, value, Qt::UserRole + 1);
+        if (pair.first == previous.toULongLong() && previousIdentity == value)
+            windows_->setCurrentIndex(windows_->count() - 1);
+    }
     audio_->setRowCount(int(settings_.audio.size()));
     for (int row = 0; row < settings_.audio.size(); ++row) {
         const auto &a = settings_.audio[row];
@@ -788,11 +822,39 @@ void MainWindow::refreshSources() {
     }
     audio_->resizeRowsToContents();
 }
+void MainWindow::refreshCaptureSources() {
+    const auto pending = readRecording();
+    const auto oldKey = registry_.cacheKey();
+    auto tested = registry_.encoders;
+    auto recommended = registry_.recommended;
+    registry_.discover();
+    if (registry_.cacheKey() == oldKey) {
+        registry_.encoders = tested;
+        registry_.recommended = recommended;
+    } else {
+        if (recorder_.active())
+            recorder_.stop();
+        status_->setText("Hardware/display configuration changed. Capture stopped; rerun encoder tests and "
+                         "calibration. Completed footage retained.");
+    }
+    populateDisplays(display_, registry_.displays, pending.monitorIdentity, pending.monitor);
+    settings_.audio = pending.audio;
+    refreshSources();
+    populateEncoders();
+    updateCaptureChoices();
+}
 Settings MainWindow::readRecording() const {
     Settings s = settings_;
     s.source = source_->currentData().toString();
     s.monitor = display_->currentData().toInt();
+    s.monitorIdentity = display_->currentData(Qt::UserRole + 1).toString();
     s.window = quintptr(windows_->currentData().toULongLong());
+    if (s.source == "window" && s.window) {
+        const auto identity = windows_->currentData(Qt::UserRole + 1).toJsonObject();
+        s.windowExecutable = identity["executable"].toString();
+        s.windowProcessCreated = identity["created"].toString();
+        s.windowPid = quint32(identity["pid"].toInteger());
+    }
     s.backend = backend_->currentData().toString();
     s.encoder = encoder_->currentData().toString();
     s.quality = recordQuality_->currentText();
@@ -817,6 +879,12 @@ Settings MainWindow::readRecording() const {
 }
 void MainWindow::applyRecording() {
     auto next = readRecording();
+    try {
+        AudioEngine::validateSources(next.audio);
+    } catch (const std::exception &e) {
+        showError(QString::fromUtf8(e.what()));
+        return;
+    }
     bool wasActive = recorder_.active();
     auto resolved = next;
     if (resolved.encoder == "auto")
@@ -862,8 +930,10 @@ void MainWindow::toggleRecording() {
             if (candidate)
                 for (auto value : candidate->tested) {
                     const auto profile = value.toObject();
-                    if (profile.contains("capture") && profile["adapter"].toInt() == s.monitor &&
-                        profile["fps"].toInt() == s.fps && profile["requestedHeight"].toInt() == s.height &&
+                    if (profile.contains("capture") &&
+                        profile["sourceKey"].toString() == captureProfileKey(s) &&
+                        profile["adapter"].toInt() == s.monitor && profile["fps"].toInt() == s.fps &&
+                        profile["requestedHeight"].toInt() == s.height &&
                         profile["source"].toString() == s.source &&
                         profile["backend"].toString() == s.backend &&
                         profile["quality"].toString() == s.quality && profile["audio"] == s.json()["audio"] &&
@@ -969,9 +1039,14 @@ void MainWindow::calibrate() {
         return;
     }
     status_->setText("Calibrating the selected capture profile…");
+    if (!QDir().mkpath(selected.bufferFolder)) {
+        showError("Cannot create the selected replay storage folder for calibration");
+        return;
+    }
+    const auto sourceKey = captureProfileKey(selected);
     auto registry = registry_;
     cancelDiscovery_ = false;
-    discovery_ = QThread::create([this, selected, choices, registry]() mutable {
+    discovery_ = QThread::create([this, selected, choices, registry, sourceKey]() mutable {
         double best = 1e30;
         QString winner;
         QJsonArray results;
@@ -980,7 +1055,13 @@ void MainWindow::calibrate() {
                 break;
             Settings s = selected;
             s.encoder = name;
-            QTemporaryDir tmp;
+            QTemporaryDir tmp(QDir(selected.bufferFolder).filePath(".calibration-XXXXXX"));
+            if (!tmp.isValid()) {
+                results << QJsonObject{
+                    {"encoder", name},
+                    {"error", "Cannot create calibration storage on the selected replay drive"}};
+                continue;
+            }
             s.bufferFolder = tmp.path();
             Recorder recorder;
             QJsonObject result{{"encoder", name}};
@@ -1011,6 +1092,7 @@ void MainWindow::calibrate() {
                         c.live = verified;
                         if (verified)
                             c.tested.append(QJsonObject{{"capture", stats.backend},
+                                                        {"sourceKey", sourceKey},
                                                         {"width", stats.width},
                                                         {"height", stats.height},
                                                         {"fps", stats.fps},
@@ -1180,6 +1262,8 @@ void MainWindow::updateStatus() {
             .arg(s.backlog)
             .arg(s.audioDiscontinuities)
             .arg(s.error.isEmpty() ? QString() : "\n" + s.error));
+    if (!s.audioNotice.isEmpty())
+        recordStats_->setText(recordStats_->text() + '\n' + s.audioNotice);
     recordStats_->setStyleSheet(s.error.isEmpty() ? (s.active ? "color:#87d7aa" : "color:#c7ccd5")
                                                   : "color:#ff9b9b");
     tray_->setToolTip(s.active ? "Recording · " + durationText(s.elapsed) : "Recording off");

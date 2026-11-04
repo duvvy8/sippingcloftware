@@ -16,8 +16,8 @@ QJsonObject Adapter::json() const {
             {"index", index}};
 }
 QJsonObject Display::json() const {
-    return {{"name", name},     {"width", width},     {"height", height}, {"adapter", adapter},
-            {"output", output}, {"refresh", refresh}, {"hdr", hdr}};
+    return {{"name", name},       {"identity", identity}, {"width", width},     {"height", height},
+            {"adapter", adapter}, {"output", output},     {"refresh", refresh}, {"hdr", hdr}};
 }
 bool EncoderCaps::replaySuitable() const {
     static const QStringList raw{"avrp", "avui", "bitpacked", "r10k", "r210", "v210", "y41p", "yuv4", "vbn"};
@@ -120,6 +120,12 @@ void Registry::discover() {
                     continue;
                 Display m;
                 m.name = QString::fromWCharArray(od.DeviceName);
+                DISPLAY_DEVICEW device{};
+                device.cb = sizeof(device);
+                if (EnumDisplayDevicesW(od.DeviceName, 0, &device, EDD_GET_DEVICE_INTERFACE_NAME))
+                    m.identity = QString::fromWCharArray(device.DeviceID);
+                if (m.identity.isEmpty())
+                    m.identity = m.name;
                 m.handle = quintptr(od.Monitor);
                 m.adapter = int(i);
                 m.output = int(j);
@@ -207,7 +213,9 @@ QString Registry::cacheKey() const {
     }
     QByteArray bytes = QJsonDocument(a).toJson(QJsonDocument::Compact) + QByteArray(av_version_info()) +
                        avcodec_configuration() + qVersion() + QByteArray::number(av_get_cpu_flags()) +
-                       "probe-v5-replay-classification";
+                       "probe-v6-source-identity";
+    for (const auto &display : displays)
+        bytes += QJsonDocument(display.json()).toJson(QJsonDocument::Compact);
     return QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex();
 }
 void Registry::probe(std::function<void(QString)> progress, std::atomic_bool *cancel, bool useCache) {

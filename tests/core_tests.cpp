@@ -1,6 +1,7 @@
 #include "jobs.h"
 #include "platform.h"
 #include "hdr.h"
+#include "audio_events.h"
 #include "replay_storage.h"
 #include "registry.h"
 #include "replay.h"
@@ -23,6 +24,120 @@ class CoreTests : public QObject {
         auto t = clip::clockSeconds();
         QTest::qSleep(10);
         QVERIFY(clip::clockSeconds() > t);
+    }
+    void sourceIdentityPersistence() {
+        clip::Settings settings;
+        settings.monitorIdentity = "monitor-interface-identity";
+        settings.window = quintptr(123456);
+        settings.windowExecutable = "C:/Games/example.exe";
+        settings.windowProcessCreated = "123456789";
+        settings.windowPid = 123;
+        clip::AudioSource source;
+        source.kind = "application";
+        source.pid = 123;
+        source.processCreated = settings.windowProcessCreated;
+        source.processExecutable = settings.windowExecutable;
+        settings.audio << source;
+        auto json = settings.json();
+        QVERIFY(!json.contains("window"));
+        clip::Settings loaded;
+        loaded.loadObject(json);
+        QCOMPARE(loaded.monitorIdentity, settings.monitorIdentity);
+        QCOMPARE(loaded.window, quintptr(0));
+        QCOMPARE(loaded.windowExecutable, settings.windowExecutable);
+        QCOMPARE(loaded.audio.first().processCreated, source.processCreated);
+        QCOMPARE(loaded.audio.first().processExecutable, source.processExecutable);
+    }
+    void calibrationProfileIdentity() {
+        clip::Settings settings;
+        auto original = clip::captureProfileKey(settings);
+        auto changed = settings;
+        changed.library = "C:/Different clip folder";
+        changed.container = "mkv";
+        QCOMPARE(clip::captureProfileKey(changed), original);
+        changed = settings;
+        changed.encoder = "another-tested-implementation";
+        QCOMPARE(clip::captureProfileKey(changed), original);
+        changed = settings;
+        changed.bufferFolder += "/other-drive-or-folder";
+        QVERIFY(clip::captureProfileKey(changed) != original);
+        changed = settings;
+        changed.monitorIdentity = "another-source";
+        QVERIFY(clip::captureProfileKey(changed) != original);
+        changed = settings;
+        changed.fps = 15;
+        QVERIFY(clip::captureProfileKey(changed) != original);
+    }
+    void processIdentityAndAudioOverlap() {
+        auto self = clip::processIdentity(GetCurrentProcessId());
+        QVERIFY(!self.isEmpty());
+        QCOMPARE(QDir::fromNativeSeparators(self["executable"].toString()).toLower(),
+                 QCoreApplication::applicationFilePath().toLower());
+        QProcess child;
+        child.setCreateProcessArgumentsModifier(
+            [](QProcess::CreateProcessArguments *p) { p->flags |= CREATE_NO_WINDOW; });
+        child.start(QCoreApplication::applicationFilePath(), {"--process-fixture"});
+        QVERIFY(child.waitForStarted(5000));
+        auto cleanup = qScopeGuard([&] {
+            child.kill();
+            child.waitForFinished(5000);
+        });
+        auto target = clip::processIdentity(quint32(child.processId()));
+        QVERIFY(!target.isEmpty());
+        QVERIFY(clip::processTreeContains(GetCurrentProcessId(), quint32(child.processId())));
+        QVERIFY(!clip::processTreeContains(quint32(child.processId()), GetCurrentProcessId()));
+        auto audio = [](const QJsonObject &p) {
+            clip::AudioSource s;
+            s.kind = "application";
+            s.pid = quint32(p["pid"].toInteger());
+            s.id = "process:" + QString::number(s.pid);
+            s.processExecutable = p["executable"].toString();
+            s.processCreated = p["created"].toString();
+            return s;
+        };
+        bool overlap = false;
+        try {
+            clip::AudioEngine::validateSources({audio(self), audio(target)});
+        } catch (const std::exception &e) {
+            overlap = QString::fromUtf8(e.what()).contains("overlapping parent/child");
+        }
+        QVERIFY(overlap);
+        auto stale = audio(target);
+        stale.processCreated = "wrong-process-creation";
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error, clip::AudioEngine::validateSources({stale}));
+    }
+    void invalidDisplayCannotFallback() {
+        clip::Registry registry;
+        registry.discover();
+        clip::Settings settings;
+        settings.monitor = -1;
+        clip::Capture capture;
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error, capture.open(settings, registry));
+        settings.monitor = 0;
+        settings.monitorIdentity = "different-display";
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error, capture.open(settings, registry));
+    }
+    void audioDeviceEventPolicy() {
+        clip::AudioSource output;
+        output.id = "fixed-output";
+        output.name = "Selected output";
+        clip::AudioSource microphone;
+        microphone.id = "fixed-microphone";
+        microphone.name = "Selected microphone";
+        microphone.kind = "microphone";
+        clip::AudioDeviceEvents events({output, microphone});
+        events.defaultChanged(false);
+        events.defaultChanged(true);
+        QVERIFY(events.notice().contains("keeps the explicitly selected output"));
+        QVERIFY(events.notice().contains("keeps the explicitly selected microphone"));
+        QVERIFY(events.error().isEmpty());
+        events.deviceState(L"unselected-device", false);
+        QVERIFY(events.error().isEmpty());
+        events.deviceState(L"fixed-microphone", false);
+        QVERIFY(events.error().contains("Selected microphone"));
+        QVERIFY(events.error().contains("No replacement"));
+        events.deviceState(L"fixed-microphone", true);
+        QVERIFY(!events.error().isEmpty()); // A reconnect does not silently resume or replace capture.
     }
     void catalogue() {
         clip::Registry r;
@@ -280,5 +395,13 @@ class CoreTests : public QObject {
         QCOMPARE(retained.readAll(), QByteArray("original recording placed here"));
     }
 };
-QTEST_GUILESS_MAIN(CoreTests)
+int main(int argc, char **argv) {
+    QCoreApplication app(argc, argv);
+    if (app.arguments().contains("--process-fixture")) {
+        QTimer::singleShot(30000, &app, &QCoreApplication::quit);
+        return app.exec();
+    }
+    CoreTests tests;
+    return QTest::qExec(&tests, argc, argv);
+}
 #include "core_tests.moc"

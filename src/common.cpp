@@ -116,15 +116,28 @@ ProcessResult runProcess(const QString &exe, const QStringList &args, int timeou
     return r;
 }
 QJsonObject AudioSource::json() const {
-    return {{"id", id},           {"name", name}, {"kind", kind},         {"pid", qint64(pid)},
-            {"enabled", enabled}, {"mute", mute}, {"separate", separate}, {"mix", mix},
-            {"ptt", pushToTalk},  {"gain", gain}, {"pushKey", pushKey},   {"pushModifiers", pushModifiers}};
+    return {{"id", id},
+            {"processExecutable", processExecutable},
+            {"processCreated", processCreated},
+            {"name", name},
+            {"kind", kind},
+            {"pid", qint64(pid)},
+            {"enabled", enabled},
+            {"mute", mute},
+            {"separate", separate},
+            {"mix", mix},
+            {"ptt", pushToTalk},
+            {"gain", gain},
+            {"pushKey", pushKey},
+            {"pushModifiers", pushModifiers}};
 }
 AudioSource AudioSource::fromJson(const QJsonObject &o) {
     AudioSource a;
     a.id = o["id"].toString();
     a.name = o["name"].toString();
     a.kind = o["kind"].toString("system");
+    a.processExecutable = o["processExecutable"].toString();
+    a.processCreated = o["processCreated"].toString();
     a.pid = quint32(o["pid"].toInteger());
     a.enabled = o["enabled"].toBool(true);
     a.mute = o["mute"].toBool();
@@ -155,6 +168,10 @@ QJsonObject Settings::json() const {
             {"container", container},
             {"quality", quality},
             {"monitor", monitor},
+            {"monitorIdentity", monitorIdentity},
+            {"windowExecutable", windowExecutable},
+            {"windowProcessCreated", windowProcessCreated},
+            {"windowPid", qint64(windowPid)},
             {"fps", fps},
             {"height", height},
             {"retention", retention},
@@ -184,6 +201,10 @@ void Settings::loadObject(const QJsonObject &o) {
     container = o["container"].toString(container);
     quality = o["quality"].toString(quality);
     monitor = o["monitor"].toInt();
+    monitorIdentity = o["monitorIdentity"].toString();
+    windowExecutable = o["windowExecutable"].toString();
+    windowProcessCreated = o["windowProcessCreated"].toString();
+    windowPid = quint32(o["windowPid"].toInteger());
     fps = o["fps"].toInt(60);
     height = o["height"].toInt();
     retention = o["retention"].toInt(300);
@@ -205,5 +226,31 @@ void Settings::loadObject(const QJsonObject &o) {
 }
 bool Settings::save() const {
     return writeJson(stateDir() + "/settings.json", json());
+}
+QJsonObject captureSettings(const Settings &s) {
+    auto result = s.json();
+    for (const auto &key : {"library", "container", "folders", "startup", "autoRecord", "notifications",
+                            "overlayHotkey", "recordHotkey", "pttHotkey"})
+        result.remove(key);
+    result["window"] = s.source == "window" ? qint64(s.window) : 0;
+    if (s.source != "window")
+        for (const auto &key : {"windowExecutable", "windowProcessCreated", "windowPid"})
+            result.remove(key);
+    return result;
+}
+QString captureProfileKey(const Settings &s) {
+    auto profile = captureSettings(s);
+    profile.remove("encoder");
+    profile["bufferFolder"] = QFileInfo(s.bufferFolder).absoluteFilePath().toLower();
+    profile["policy"] = 2;
+    if (s.source == "window") {
+        RECT bounds{};
+        if (GetWindowRect(HWND(s.window), &bounds))
+            profile["windowDimensions"] =
+                QJsonArray{int(bounds.right - bounds.left), int(bounds.bottom - bounds.top)};
+    }
+    return QCryptographicHash::hash(QJsonDocument(profile).toJson(QJsonDocument::Compact),
+                                    QCryptographicHash::Sha256)
+        .toHex();
 }
 } // namespace clip

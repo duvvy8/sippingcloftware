@@ -2,8 +2,12 @@
 #include "common.h"
 #include <QAbstractNativeEventFilter>
 namespace clip {
+QJsonObject processIdentity(quint32 pid);
+bool processTreeContains(quint32 ancestor, quint32 process);
 struct ApplicationIdentity {
     QString name = "Desktop", executable;
+    QString processCreated;
+    quint32 pid = 0;
     quintptr window = 0;
 };
 ApplicationIdentity foregroundApplication();
