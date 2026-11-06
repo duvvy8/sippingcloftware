@@ -297,3 +297,34 @@ render over a gradient showed clear space around the open preset panel. The
 DXGI pixel test kept a fixture pixel unchanged with the 38% dim layer visible.
 The UI suite checks dismissal on Escape and application deactivation, and
 checks that a successful save reports the finished clip's media details.
+
+## PR #1 local Windows 10 verification — 2026-11-06
+
+Validated v11exe's PR head `2270110` with the local compatibility fixes below.
+Release x64 built with the pinned Qt/FFmpeg dependencies. All seven CTest targets
+passed (75.19 seconds): core, media, compression, notifications, and native UI at
+100%, 150%, and 200%. Logs: `test-output/pr1-build-tests.log` and the corresponding
+core/media/compression/notifications/UI text reports. Core includes exact pixel
+orientation tests for 0/90/180/270 degrees and immutable input preservation.
+
+The initial translucent HUD could not obtain capture exclusion on this Windows
+10 compositor and its error dialog blocked the toolbar test. It now recreates
+the hidden HUD with an opaque dark surface, requires capture exclusion again,
+and displays neither surface if exclusion still fails. Windows 11 can continue
+using the original native backdrop. Local tests verify the HUD/menu capture
+affinity and a real DXGI pixel remaining unchanged with the dimmer visible.
+
+The second display is portrait. DXGI supplies an unrotated texture on that
+display; capture now applies the reported rotation before emitting the desktop
+frame. Native DXGI pixel verification and automatic-profile calibration pass on
+that display, alongside a real WGC window capture and fixed-endpoint export.
+The UI tests use that display, show without activating, and send Qt-local test
+events without moving the system pointer. `--screen secondary --no-focus` provides
+the same placement/focus behavior for the running application. The main controls
+scroll when their contents exceed the available window size.
+
+Notification COM delivery and restart activation pass on this host. Native toast
+popup/history remains explicitly skipped because the user's Windows notification
+setting is disabled. Existing shell registrations were backed up and restored
+around the tests. Physical HDR/Intel/microphone/Windows 11 support was not newly
+verified here. This PR sync is not completion of the full implementation plan.

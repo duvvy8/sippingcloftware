@@ -10,9 +10,18 @@ class UiTests : public QObject {
     std::unique_ptr<MainWindow> window_;
     QString sample_;
     QString expectedDisplay_;
+    QScreen *testScreen_ = nullptr;
   private slots:
     void initTestCase() {
         qputenv("CLIPPER_STATE_DIR", temporary_.path().toUtf8());
+        qputenv("CLIPPER_UI_SCREEN", "secondary");
+        qputenv("CLIPPER_BACKGROUND_UI", "1");
+        testScreen_ = QGuiApplication::primaryScreen();
+        for (auto *screen : QGuiApplication::screens())
+            if (screen != QGuiApplication::primaryScreen()) {
+                testScreen_ = screen;
+                break;
+            }
         applyAppearance(*qobject_cast<QApplication *>(QCoreApplication::instance()));
         QApplication::setQuitOnLastWindowClosed(false);
         Settings settings;
@@ -25,7 +34,14 @@ class UiTests : public QObject {
         Registry hardware;
         hardware.discover();
         QVERIFY(!hardware.displays.isEmpty());
-        expectedDisplay_ = hardware.displays.last().identity;
+        expectedDisplay_ = hardware.displays.first().identity;
+        for (const auto &display : hardware.displays) {
+            MONITORINFO info{sizeof(info)};
+            if (GetMonitorInfoW(HMONITOR(display.handle), &info) && !(info.dwFlags & MONITORINFOF_PRIMARY)) {
+                expectedDisplay_ = display.identity;
+                break;
+            }
+        }
         settings.monitorIdentity = expectedDisplay_;
         settings.monitor = 0; // Deliberately stale enumeration index; identity must win.
         QVERIFY(settings.save());
@@ -104,25 +120,18 @@ class UiTests : public QObject {
         QVERIFY(!hud->dim_->isVisible());
     }
     void dimmerStaysOutOfDxgiCapture() {
-        const auto foreground = GetForegroundWindow();
-        const auto monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTOPRIMARY);
-        MONITORINFOEXW details{};
-        details.cbSize = sizeof(details);
-        QVERIFY(GetMonitorInfoW(monitor, &details));
-        QScreen *screen = nullptr;
-        for (auto *candidate : QGuiApplication::screens())
-            if (candidate->name() == QString::fromWCharArray(details.szDevice)) {
-                screen = candidate;
-                break;
-            }
-        QVERIFY(screen);
+        auto *screen = testScreen_;
         QWidget fixture(nullptr, Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
         fixture.setAttribute(Qt::WA_ShowWithoutActivating);
         fixture.setStyleSheet("background:#98cbe4");
         const auto area = screen->availableGeometry();
         fixture.setGeometry(area.left(), area.center().y() - 185, 380, 370);
         fixture.show();
-        fixture.raise();
+        const auto monitor = MonitorFromWindow(HWND(fixture.winId()), MONITOR_DEFAULTTONULL);
+        QVERIFY(monitor);
+        MONITORINFOEXW details{};
+        details.cbSize = sizeof(details);
+        QVERIFY(GetMonitorInfoW(monitor, &details));
         auto *hud = window_->toolbar_;
         const auto close = qScopeGuard([&] { hud->hide(); });
         Settings settings;

@@ -14,7 +14,7 @@ No release or goal completion until all mandatory implementation is finished.
 | B04 | Pinned dependencies, reproducible bootstrap/build, source and licence notices | Partially tested: pinned lock/bootstrap and default local .deps build; bootstrap -CacheRoot successfully copied Qt/FFmpeg and verified font hashes. Canonical FFmpeg download is now a dated archive with a pinned hash; clean network bootstrap/source notices remain pending. |
 | B05 | SippingCloftware display name and bundled Inter and Geist Mono | Implemented: application, tray and shell labels use SippingCloftware. Both fonts and their OFL notices are bundled for the main window. |
 | B06 | Release dependency staging; per-user installer and uninstall | Pending |
-| B07 | Windows 10 22H2 and Windows 11 support | Pending; host Windows 10 19045, AMD iGPU + NVIDIA RTX 5070 Ti |
+| B07 | Windows 10 22H2 and Windows 11 support | Partially tested: Windows 10 19045 Release build and all seven CTest targets pass after PR #1 compatibility fixes (2026-11-06); Windows 11 was not newly verified locally. See docs/VERIFICATION.md. |
 
 ## 2. Hardware and encoder discovery
 | ID | Requirement | Status / evidence |
@@ -32,7 +32,7 @@ No release or goal completion until all mandatory implementation is finished.
 ## 3. Capture, audio, storage and saves
 | ID | Requirement | Status / evidence |
 |---|---|---|
-| C01 | WGC/D3D11 window and monitor capture; DXGI monitor fallback | Partially tested: prior WGC window save/changing-content verification; after restart WGC and DXGI monitor saves at 1280x720/60, zero dropped/backlog, fixed 3s intervals, completely decoded. DXGI output 2.983333s within one-frame tolerance; WGC 3s. Device-loss paths remain untested. |
+| C01 | WGC/D3D11 window and monitor capture; DXGI monitor fallback | Partially tested: prior WGC window save/changing-content verification; after restart WGC and DXGI monitor saves at 1280x720/60, zero dropped/backlog, fixed 3s intervals, completely decoded. DXGI output 2.983333s within one-frame tolerance; WGC 3s. Portrait DXGI rotation, dimmer exclusion pixels and automatic-profile capture calibration also pass on the second display at all UI scales (2026-11-06). Device-loss paths remain untested. |
 | C02 | Monotonic timestamps; retain source identity before toolbar focus | Partially tested: QPC timing, stable monitor interface identity, PID/executable/creation identity, fixed endpoint before toolbar focus. Tests prove stale display indices do not choose a different monitor and missing windows/displays require reselection. External foreground-executable folder override exercise remains open. |
 | C03 | Disk ring: independent compressed ~2s segments, default 300s / 4 GiB | Implemented / untested: recorder and replay.cpp; independent ~2s Matroska segments, defaults 300s / 4 GiB. |
 | C04 | Configurable storage/limits; duration and bytes whichever first, actual duration | Tested ring duration/byte limits and actual interval duration in core tests. Settings expose storage path, duration and byte limits. |

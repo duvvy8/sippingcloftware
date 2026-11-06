@@ -5,10 +5,35 @@
 #include "replay_storage.h"
 #include "registry.h"
 #include "replay.h"
+#include "capture.h"
 #include <QtTest>
 class CoreTests : public QObject {
     Q_OBJECT
   private slots:
+    void portraitDesktopOrientation() {
+        clip::CapturedFrame source;
+        source.width = 3;
+        source.height = 2;
+        source.stride = 12;
+        source.timestamp = 123.5;
+        const quint32 pixels[] = {1, 2, 3, 4, 5, 6};
+        source.pixels = QByteArray(reinterpret_cast<const char *>(pixels), sizeof(pixels));
+        const QList<QList<quint32>> expected{{1, 2, 3, 4, 5, 6}, {4, 1, 5, 2, 6, 3},
+                                           {6, 5, 4, 3, 2, 1}, {3, 6, 2, 5, 1, 4}};
+        for (int i = 0; i < 4; ++i) {
+            auto frame = source;
+            clip::orientDesktopFrame(frame, i * 90);
+            QCOMPARE(frame.width, i % 2 ? 2 : 3);
+            QCOMPARE(frame.height, i % 2 ? 3 : 2);
+            QCOMPARE(frame.timestamp, source.timestamp);
+            for (int n = 0; n < 6; ++n) {
+                quint32 pixel;
+                memcpy(&pixel, frame.pixels.constData() + n * 4, sizeof(pixel));
+                QCOMPARE(pixel, expected[i][n]);
+            }
+        }
+        QCOMPARE(source.pixels, QByteArray(reinterpret_cast<const char *>(pixels), sizeof(pixels)));
+    }
     void filenames() {
         QCOMPARE(clip::safeName("CON"), QString("_CON"));
         QCOMPARE(clip::safeName("a/b:foo. "), QString("a_b_foo"));

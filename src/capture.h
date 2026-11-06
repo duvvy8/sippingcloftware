@@ -11,6 +11,7 @@ struct CapturedFrame {
     double timestamp = 0;
     ApplicationIdentity fullscreenApp;
 };
+void orientDesktopFrame(CapturedFrame &, int clockwiseDegrees);
 class Capture {
     struct Impl;
     std::unique_ptr<Impl> impl_;

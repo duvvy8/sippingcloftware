@@ -18,6 +18,10 @@ Run `build/bin/Release/SippingCloftware.exe`. Pass `--show` to open the main win
 immediately. The default shortcuts are **Ctrl+Shift+S** for the clip toolbar and
 **Ctrl+Shift+R** to start or stop recording.
 
+Use `--show --screen secondary --no-focus` to open the controls on a second
+display without activating them. The HUD and application dialogs also use that
+display. `--screen` accepts a Windows screen name as well as `secondary`.
+
 Recording starts on launch when a capture source is available. In **Settings**,
 you can turn that off or choose to launch SippingCloftware when you sign in.
 The HUD's **Mic** and **Desktop Audio** switches control which buffered audio

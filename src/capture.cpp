@@ -1,5 +1,7 @@
 #include "capture.h"
 #include "platform.h"
+#include <QImage>
+#include <QTransform>
 #include <dxgi1_6.h>
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
@@ -14,6 +16,21 @@ using namespace winrt::Windows::Graphics::DirectX::Direct3D11;
 using Microsoft::WRL::ComPtr;
 using ::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess;
 namespace clip {
+void orientDesktopFrame(CapturedFrame &frame, int clockwiseDegrees) {
+    if (!clockwiseDegrees)
+        return;
+    if (frame.floating || (clockwiseDegrees != 90 && clockwiseDegrees != 180 && clockwiseDegrees != 270))
+        throw std::runtime_error("Unsupported desktop capture orientation");
+    const QImage source(reinterpret_cast<const uchar *>(frame.pixels.constData()), frame.width,
+                        frame.height, frame.stride, QImage::Format_ARGB32);
+    const auto rotated = source.transformed(QTransform().rotate(clockwiseDegrees));
+    if (rotated.isNull())
+        throw std::runtime_error("Could not orient desktop capture");
+    frame.width = rotated.width();
+    frame.height = rotated.height();
+    frame.stride = rotated.bytesPerLine();
+    frame.pixels = QByteArray(reinterpret_cast<const char *>(rotated.constBits()), rotated.sizeInBytes());
+}
 struct Capture::Impl {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
@@ -30,6 +47,7 @@ struct Capture::Impl {
     HWND sourceWindow = nullptr;
     HMONITOR sourceMonitor = nullptr;
     int width = 0, height = 0;
+    int rotation = 0;
     double lastRead = 0, interval = 1. / 60;
     void read(ID3D11Texture2D *texture, CapturedFrame &out, int w, int h, double timestamp) {
         D3D11_TEXTURE2D_DESC desc{};
@@ -128,6 +146,14 @@ void Capture::open(const Settings &s, const Registry &r) {
         ComPtr<IDXGIOutput1> duplication;
         check_hresult(output.As(&duplication));
         check_hresult(duplication->DuplicateOutput(p.device.Get(), &p.duplication));
+        DXGI_OUTDUPL_DESC description{};
+        p.duplication->GetDesc(&description);
+        switch (description.Rotation) {
+        case DXGI_MODE_ROTATION_ROTATE90: p.rotation = 90; break;
+        case DXGI_MODE_ROTATION_ROTATE180: p.rotation = 180; break;
+        case DXGI_MODE_ROTATION_ROTATE270: p.rotation = 270; break;
+        default: p.rotation = 0; break;
+        }
         p.width = display.width;
         p.height = display.height;
         p.backend = "DXGI Desktop Duplication";
@@ -252,7 +278,9 @@ bool Capture::next(CapturedFrame &out) {
                 return false;
             }
             p.lastRead = t;
-            p.read(texture.Get(), out, p.width, p.height, t);
+            const bool portrait = p.rotation == 90 || p.rotation == 270;
+            p.read(texture.Get(), out, portrait ? p.height : p.width, portrait ? p.width : p.height, t);
+            orientDesktopFrame(out, p.rotation);
             p.duplication->ReleaseFrame();
             return true;
         } catch (...) {

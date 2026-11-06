@@ -8,6 +8,45 @@
 #include <cmath>
 namespace clip {
 namespace {
+QScreen *requestedUiScreen() {
+    const auto args = QCoreApplication::arguments();
+    const int option = args.indexOf("--screen");
+    const auto name = option >= 0 ? args.value(option + 1) : qEnvironmentVariable("CLIPPER_UI_SCREEN");
+    if (name == "secondary") {
+        for (auto *screen : QGuiApplication::screens())
+            if (screen != QGuiApplication::primaryScreen())
+                return screen;
+    } else if (!name.isEmpty()) {
+        for (auto *screen : QGuiApplication::screens())
+            if (screen->name().compare(name, Qt::CaseInsensitive) == 0)
+                return screen;
+    }
+    return nullptr;
+}
+bool backgroundUi() {
+    return QCoreApplication::arguments().contains("--no-focus") ||
+           qEnvironmentVariableIsSet("CLIPPER_BACKGROUND_UI");
+}
+class WindowPlacement : public QObject {
+  public:
+    using QObject::QObject;
+    bool eventFilter(QObject *object, QEvent *event) override {
+        if (event->type() == QEvent::Polish)
+            if (auto *window = qobject_cast<QWidget *>(object); window && window->isWindow()) {
+                if (backgroundUi())
+                    window->setAttribute(Qt::WA_ShowWithoutActivating);
+                if (auto *screen = requestedUiScreen(); screen && window->objectName() != "clipToolbar" &&
+                    window->windowTitle() != "Clipping toolbar dimmer") {
+                    const auto area = screen->availableGeometry().adjusted(8, 30, -8, -8);
+                    window->setMinimumSize(window->minimumSize().boundedTo(area.size()));
+                    window->setMaximumSize(area.size());
+                    window->resize(window->size().boundedTo(area.size()));
+                    window->move(area.center() - window->rect().center());
+                }
+            }
+        return false;
+    }
+};
 QFont mono() {
     return QFont("Geist Mono", 10);
 }
@@ -77,6 +116,8 @@ void populateDisplays(QComboBox *box, const QList<Display> &displays, const QStr
 }
 } // namespace
 void applyAppearance(QApplication &app) {
+    if (requestedUiScreen() || backgroundUi())
+        app.installEventFilter(new WindowPlacement(&app));
     QString interFamily;
     for (const auto &file : {"InterVariable.ttf", "GeistMono-Regular.ttf"}) {
         const int id = QFontDatabase::addApplicationFont(QCoreApplication::applicationDirPath() +
@@ -158,7 +199,7 @@ MainWindow::MainWindow(bool activationOnly)
     status_ = new QLabel("Recording off · Open the toolbar with " + settings_.overlayHotkey);
     status_->setWordWrap(true);
     layout->addWidget(status_);
-    setCentralWidget(body);
+    setCentralWidget(scrollPage(body));
     toolbar_ = new ClipToolbar(this);
     auto *menu = new QMenu(this);
     auto *openControls = menu->addAction("Open SippingCloftware", this, &MainWindow::showControls);
@@ -1379,8 +1420,10 @@ void MainWindow::showPlayer(const QString &path) {
 }
 void MainWindow::openClip(const QString &path) {
     showNormal();
-    raise();
-    activateWindow();
+    if (!backgroundUi()) {
+        raise();
+        activateWindow();
+    }
     tabs_->setCurrentIndex(0);
     selectedPath_ = path;
     refreshLibrary();
@@ -1470,9 +1513,11 @@ void MainWindow::showControls() {
     const auto handle = HWND(winId());
     // A process launched with SW_HIDE can have its first native show suppressed.
     if (!IsWindowVisible(handle))
-        ShowWindow(handle, SW_SHOW);
-    raise();
-    activateWindow();
+        ShowWindow(handle, backgroundUi() ? SW_SHOWNOACTIVATE : SW_SHOW);
+    if (!backgroundUi()) {
+        raise();
+        activateWindow();
+    }
 }
 void MainWindow::exitApplication() {
     exiting_ = true;
@@ -2041,7 +2086,8 @@ void ClipToolbar::updateBackdrop() {
     for (auto *panel : {options_, advanced_})
         if (!panel->isHidden())
             surfaces << panel->geometry();
-    const bool visible = backdrop_->update(HWND(winId()), surfaces, devicePixelRatioF());
+    const bool visible = testAttribute(Qt::WA_TranslucentBackground) &&
+                         backdrop_->update(HWND(winId()), surfaces, devicePixelRatioF());
     if (acrylic_ != visible) {
         acrylic_ = visible;
         update();
@@ -2181,7 +2227,7 @@ void ClipToolbar::open() {
     showDuration();
     auto screen = QGuiApplication::screenAt(QCursor::pos());
     const auto foreground = GetForegroundWindow();
-    if (foreground) {
+    if (foreground && !requestedUiScreen()) {
         const HMONITOR active = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
         MONITORINFOEXW info{};
         info.cbSize = sizeof(info);
@@ -2194,13 +2240,29 @@ void ClipToolbar::open() {
     }
     if (!screen)
         screen = QGuiApplication::primaryScreen();
+    if (auto *requested = requestedUiScreen())
+        screen = requested;
     auto area = screen->availableGeometry();
     refreshChoices(stats.height);
     layoutSurfaces();
     move(area.left() + 12, area.top() + qMax(0, (area.height() - height()) / 2));
-    const auto handle = HWND(winId());
-    if (!excludeFromCapture(quintptr(handle))) {
-        owner_->showError("Windows could not exclude the toolbar from monitor capture");
+    auto handle = HWND(winId());
+    bool excluded = excludeFromCapture(quintptr(handle));
+    if (!excluded && testAttribute(Qt::WA_TranslucentBackground)) {
+        // Some Windows 10 compositor configurations cannot exclude a per-pixel
+        // layered window. Recreate the hidden HUD with the solid dark fallback
+        // before displaying anything, then require capture exclusion again.
+        backdrop_->hide();
+        destroy(true, false);
+        setAttribute(Qt::WA_TranslucentBackground, false);
+        setAttribute(Qt::WA_NoSystemBackground, false);
+        handle = HWND(winId());
+        excluded = excludeFromCapture(quintptr(handle));
+    }
+    if (!excluded) {
+        const auto reason = GetLastError();
+        owner_->showError(QString("Windows could not exclude the toolbar from monitor capture (error %1)")
+                              .arg(reason));
         release();
         return;
     }
@@ -2217,7 +2279,8 @@ void ClipToolbar::open() {
     }
     show();
     SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    activateWindow();
+    if (!backgroundUi())
+        activateWindow();
     if (dim_->isVisible())
         SetWindowPos(HWND(dim_->winId()), handle, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
