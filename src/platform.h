@@ -23,15 +23,19 @@ class Hotkeys : public QObject, public QAbstractNativeEventFilter {
     struct Binding {
         int id = 0;
         QString text;
+        bool registered = false;
     };
     QMap<QString, Binding> bindings_;
     int nextId_ = 100;
+    bool suspended_ = false;
 
   public:
     explicit Hotkeys(QObject *parent = nullptr);
     ~Hotkeys();
     static bool parse(const QString &, UINT &modifiers, UINT &key);
     bool assign(const QString &command, const QString &shortcut, QString *error = nullptr);
+    bool setSuspended(bool suspended, QString *error = nullptr);
+    bool suspended() const { return suspended_; }
     bool nativeEventFilter(const QByteArray &, void *, qintptr *) override;
   signals:
     void activated(QString command);

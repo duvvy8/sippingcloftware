@@ -240,7 +240,8 @@ Hotkeys::Hotkeys(QObject *p) : QObject(p) {
 Hotkeys::~Hotkeys() {
     QCoreApplication::instance()->removeNativeEventFilter(this);
     for (auto b : bindings_)
-        UnregisterHotKey(nullptr, b.id);
+        if (b.registered)
+            UnregisterHotKey(nullptr, b.id);
 }
 bool Hotkeys::parse(const QString &text, UINT &modifiers, UINT &key) {
     QKeySequence seq(text, QKeySequence::PortableText);
@@ -275,36 +276,102 @@ bool Hotkeys::parse(const QString &text, UINT &modifiers, UINT &key) {
         key = VK_PRIOR;
     else if (value == Qt::Key_PageDown)
         key = VK_NEXT;
-    else
-        return false;
+    else {
+        const QMap<int, UINT> special{{Qt::Key_Tab, VK_TAB}, {Qt::Key_Backspace, VK_BACK},
+                                    {Qt::Key_Return, VK_RETURN}, {Qt::Key_Enter, VK_RETURN},
+                                    {Qt::Key_Delete, VK_DELETE}, {Qt::Key_Left, VK_LEFT},
+                                    {Qt::Key_Right, VK_RIGHT}, {Qt::Key_Up, VK_UP},
+                                    {Qt::Key_Down, VK_DOWN}, {Qt::Key_Pause, VK_PAUSE},
+                                    {Qt::Key_CapsLock, VK_CAPITAL}, {Qt::Key_ScrollLock, VK_SCROLL},
+                                    {Qt::Key_NumLock, VK_NUMLOCK}};
+        if (special.contains(value))
+            key = special.value(value);
+        else if (value >= 0x20 && value <= 0x7e) {
+            const SHORT mapped = VkKeyScanExW(wchar_t(value), GetKeyboardLayout(0));
+            if (mapped == -1)
+                return false;
+            key = LOBYTE(mapped);
+            const auto shift = HIBYTE(mapped);
+            if (shift & 1) modifiers |= MOD_SHIFT;
+            if (shift & 2) modifiers |= MOD_CONTROL;
+            if (shift & 4) modifiers |= MOD_ALT;
+        } else
+            return false;
+    }
+    if (k.keyboardModifiers() & Qt::KeypadModifier) {
+        modifiers = 0;
+        if (k.keyboardModifiers() & Qt::ControlModifier) modifiers |= MOD_CONTROL;
+        if (k.keyboardModifiers() & Qt::ShiftModifier) modifiers |= MOD_SHIFT;
+        if (k.keyboardModifiers() & Qt::AltModifier) modifiers |= MOD_ALT;
+        if (k.keyboardModifiers() & Qt::MetaModifier) modifiers |= MOD_WIN;
+        if (value >= '0' && value <= '9') key = VK_NUMPAD0 + value - '0';
+        else if (value == '+') key = VK_ADD;
+        else if (value == '-') key = VK_SUBTRACT;
+        else if (value == '*') key = VK_MULTIPLY;
+        else if (value == '/') key = VK_DIVIDE;
+        else if (value == '.') key = VK_DECIMAL;
+        else return false; // RegisterHotKey cannot distinguish other keypad variants.
+    }
     return true;
 }
 bool Hotkeys::assign(const QString &command, const QString &shortcut, QString *error) {
-    if (bindings_.contains(command) && bindings_[command].text == shortcut)
-        return true;
     UINT mod = 0, key = 0;
     if (!parse(shortcut, mod, key)) {
         if (error)
             *error = "Choose one supported keyboard shortcut";
         return false;
     }
+    const auto canonical = QKeySequence(shortcut, QKeySequence::PortableText).toString(QKeySequence::PortableText);
+    for (auto it = bindings_.cbegin(); it != bindings_.cend(); ++it) {
+        UINT otherMods = 0, otherKey = 0;
+        if (it.key() != command && parse(it->text, otherMods, otherKey) && mod == otherMods && key == otherKey) {
+            if (error) *error = "That shortcut is assigned to another action. The existing binding remains active.";
+            return false;
+        }
+    }
+    if (bindings_.contains(command) && bindings_[command].text == canonical &&
+        (bindings_[command].registered || suspended_))
+        return true;
     int id = nextId_++;
     if (!RegisterHotKey(nullptr, id, mod | MOD_NOREPEAT, key)) {
         if (error)
             *error = "Shortcut is already registered. The existing binding remains active.";
         return false;
     }
-    if (bindings_.contains(command))
+    if (bindings_.contains(command) && bindings_[command].registered)
         UnregisterHotKey(nullptr, bindings_[command].id);
-    bindings_[command] = {id, shortcut};
+    if (suspended_)
+        UnregisterHotKey(nullptr, id);
+    bindings_[command] = {id, canonical, !suspended_};
     return true;
+}
+bool Hotkeys::setSuspended(bool suspended, QString *error) {
+    suspended_ = suspended;
+    QStringList failed;
+    for (auto it = bindings_.begin(); it != bindings_.end(); ++it) {
+        if (suspended) {
+            if (it->registered)
+                UnregisterHotKey(nullptr, it->id);
+            it->registered = false;
+        } else if (!it->registered) {
+            UINT modifiers = 0, key = 0;
+            it->registered = parse(it->text, modifiers, key) &&
+                             RegisterHotKey(nullptr, it->id, modifiers | MOD_NOREPEAT, key);
+            if (!it->registered)
+                failed << it->text;
+        }
+    }
+    if (!failed.isEmpty() && error)
+        *error = "Could not restore shortcut(s): " + failed.join(", ") + ". Another application may be using them.";
+    return failed.isEmpty();
 }
 bool Hotkeys::nativeEventFilter(const QByteArray &, void *message, qintptr *) {
     auto *m = static_cast<MSG *>(message);
     if (m->message == WM_HOTKEY) {
         for (auto i = bindings_.begin(); i != bindings_.end(); ++i)
             if (i->id == int(m->wParam)) {
-                emit activated(i.key());
+                if (!suspended_ && i->registered)
+                    emit activated(i.key());
                 return true;
             }
     }

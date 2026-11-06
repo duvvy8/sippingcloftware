@@ -2,6 +2,31 @@
 #include <cmath>
 #include <windows.h>
 #include <mmsystem.h>
+#include <mmddk.h>
+struct WaveTone {
+    HWAVEOUT device = nullptr;
+    WAVEHDR header{};
+    ~WaveTone() {
+        if (device) {
+            waveOutReset(device);
+            if (header.dwFlags & WHDR_PREPARED)
+                waveOutUnprepareHeader(device, &header, sizeof(header));
+            waveOutClose(device);
+        }
+    }
+    MMRESULT start(UINT index, QByteArray &wave) {
+        WAVEFORMATEX format{WAVE_FORMAT_PCM, 2, 48000, 192000, 4, 16, 0};
+        auto result = waveOutOpen(&device, index, &format, 0, 0, CALLBACK_NULL);
+        if (result != MMSYSERR_NOERROR) return result;
+        header.lpData = wave.data() + 44;
+        header.dwBufferLength = DWORD(wave.size() - 44);
+        result = waveOutPrepareHeader(device, &header, sizeof(header));
+        if (result != MMSYSERR_NOERROR) return result;
+        header.dwFlags |= WHDR_BEGINLOOP | WHDR_ENDLOOP;
+        header.dwLoops = MAXDWORD;
+        return waveOutWrite(device, &header, sizeof(header));
+    }
+};
 class Pattern : public QWidget {
     QTimer timer_;
     quint64 frame_ = 0;
@@ -9,7 +34,7 @@ class Pattern : public QWidget {
         QPainter p(this);
         p.fillRect(rect(), QColor(14, 18, 24));
         p.setPen(QColor(220, 225, 230));
-        p.setFont(QFont("Consolas", 11));
+        p.setFont(QFont("Geist Mono", 11));
         p.drawText(24, 36,
                    QString("Capture verification / frame %1 / %2 ms")
                        .arg(frame_)
@@ -30,7 +55,11 @@ class Pattern : public QWidget {
   public:
     Pattern() {
         setWindowTitle("Capture verification");
-        resize(1280, 720);
+        setWindowFlag(Qt::WindowStaysOnTopHint);
+        setAttribute(Qt::WA_ShowWithoutActivating);
+        const auto area = QGuiApplication::primaryScreen()->availableGeometry().adjusted(20, 40, -20, -20);
+        resize(QSize(1280, 720).boundedTo(area.size()));
+        move(area.center() - rect().center());
         connect(&timer_, &QTimer::timeout, this, [this] {
             ++frame_;
             update();
@@ -41,6 +70,65 @@ class Pattern : public QWidget {
 };
 int main(int argc, char **argv) {
     QApplication app(argc, argv);
+    for (const auto &file : {"InterVariable.ttf", "GeistMono-Regular.ttf"}) {
+        const int font = QFontDatabase::addApplicationFont(QCoreApplication::applicationDirPath() + "/assets/fonts/" + file);
+        if (font < 0)
+            return 2;
+        if (QString(file).startsWith("Inter"))
+            app.setFont(QFont(QFontDatabase::applicationFontFamilies(font).value(0), 10));
+    }
+    QTimer stop;
+    const auto args = app.arguments();
+    const auto value = [&](const QString &option) {
+        const int index = args.indexOf(option);
+        return index >= 0 ? args.value(index + 1) : QString();
+    };
+    QJsonArray devices;
+    UINT output = WAVE_MAPPER;
+    const auto requested = value("--output-device");
+    bool matched = requested.isEmpty();
+    for (UINT i = 0; i < waveOutGetNumDevs(); ++i) {
+        size_t bytes = 0;
+        const auto handle = reinterpret_cast<HWAVEOUT>(UINT_PTR(i));
+        if (waveOutMessage(handle, DRV_QUERYFUNCTIONINSTANCEIDSIZE, DWORD_PTR(&bytes), 0) ||
+            !bytes || bytes > 65536)
+            continue;
+        std::vector<wchar_t> identity(bytes / sizeof(wchar_t) + 1);
+        if (waveOutMessage(handle, DRV_QUERYFUNCTIONINSTANCEID, DWORD_PTR(identity.data()), bytes))
+            continue;
+        WAVEOUTCAPSW caps{};
+        waveOutGetDevCapsW(i, &caps, sizeof(caps));
+        const auto id = QString::fromWCharArray(identity.data());
+        devices.append(QJsonObject{{"index", int(i)}, {"id", id}, {"name", QString::fromWCharArray(caps.szPname)}});
+        if (!requested.isEmpty() && requested.compare(id, Qt::CaseInsensitive) == 0) {
+            output = i;
+            matched = true;
+        }
+    }
+    QJsonObject report{{"devices", devices}, {"requestedDevice", requested}, {"matched", matched}};
+    const auto writeReport = [&] {
+        if (const auto path = value("--report"); !path.isEmpty()) {
+            QSaveFile file(path);
+            if (file.open(QIODevice::WriteOnly)) {
+                file.write(QJsonDocument(report).toJson());
+                file.commit();
+            }
+        }
+    };
+    writeReport();
+    if (args.contains("--list-audio"))
+        return 0;
+    if (!matched)
+        return 5;
+    const int stopOption = args.indexOf("--stop-file");
+    if (stopOption >= 0) {
+        const auto path = args.value(stopOption + 1);
+        QObject::connect(&stop, &QTimer::timeout, &app, [&, path] {
+            if (QFileInfo::exists(path))
+                app.quit();
+        });
+        stop.start(100);
+    }
     QByteArray wave;
     auto u16 = [&](quint16 v) {
         wave.append(char(v));
@@ -68,11 +156,25 @@ int main(int argc, char **argv) {
         u16(quint16(sample));
         u16(quint16(sample));
     }
-    if (app.arguments().contains("--tone"))
-        PlaySoundW(reinterpret_cast<LPCWSTR>(wave.constData()), nullptr, SND_MEMORY | SND_ASYNC | SND_LOOP);
+    WaveTone tone;
+    if (app.arguments().contains("--tone")) {
+        const auto result = tone.start(output, wave);
+        report["renderResult"] = int(result);
+        writeReport();
+        if (result != MMSYSERR_NOERROR)
+            return 4;
+    }
     Pattern w;
     w.show();
+    ShowWindow(HWND(w.winId()), SW_SHOWNOACTIVATE);
     int result = app.exec();
-    PlaySoundW(nullptr, nullptr, 0);
+    if (tone.device) {
+        MMTIME played{};
+        played.wType = TIME_SAMPLES;
+        report["positionResult"] = int(waveOutGetPosition(tone.device, &played, sizeof(played)));
+        report["positionType"] = int(played.wType);
+        report["playedSamples"] = qint64(played.u.sample);
+        writeReport();
+    }
     return result;
 }

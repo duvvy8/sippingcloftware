@@ -54,7 +54,7 @@ bool Instance::acquire(QString *error) {
     }
     return true;
 }
-bool Instance::forward(const QJsonObject &message, QString *error) {
+bool Instance::forward(const QJsonObject &message, QString *error, int acknowledgementMs) {
     QLocalSocket socket;
     for (int attempt = 0; attempt < 10; ++attempt) {
         socket.connectToServer(name_);
@@ -72,7 +72,7 @@ bool Instance::forward(const QJsonObject &message, QString *error) {
     if (bytes.size() > 4096 || socket.write(bytes) != bytes.size())
         return false;
     socket.flush();
-    if (!socket.waitForReadyRead(2000) || socket.readLine() != "OK\n") {
+    if (!socket.waitForReadyRead(acknowledgementMs) || socket.readLine() != "OK\n") {
         if (error)
             *error = "The existing application did not acknowledge this request";
         return false;

@@ -118,6 +118,8 @@ class MainWindow : public QMainWindow {
     void exitApplication();
     void openClip(const QString &);
     void handleNotificationAction(const QString &);
+    QJsonObject runtimeStatus();
+    QString saveRecent(double seconds);
     bool notificationsEnabled() const {
         return settings_.notifications;
     }

@@ -11,7 +11,7 @@ class Instance : public QObject {
   public:
     explicit Instance(QObject *parent = nullptr);
     bool acquire(QString *error = nullptr);
-    bool forward(const QJsonObject &, QString *error = nullptr);
+    bool forward(const QJsonObject &, QString *error = nullptr, int acknowledgementMs = 2000);
   signals:
     void received(QJsonObject message);
 };

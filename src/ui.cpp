@@ -47,6 +47,21 @@ class WindowPlacement : public QObject {
         return false;
     }
 };
+class ShortcutEdit : public QKeySequenceEdit {
+    std::function<void(bool)> capture_;
+  public:
+    ShortcutEdit(const QKeySequence &sequence, std::function<void(bool)> capture)
+        : QKeySequenceEdit(sequence), capture_(std::move(capture)) {}
+  protected:
+    void focusInEvent(QFocusEvent *event) override {
+        capture_(true);
+        QKeySequenceEdit::focusInEvent(event);
+    }
+    void focusOutEvent(QFocusEvent *event) override {
+        QKeySequenceEdit::focusOutEvent(event);
+        capture_(false);
+    }
+};
 QFont mono() {
     return QFont("Geist Mono", 10);
 }
@@ -182,9 +197,7 @@ MainWindow::MainWindow(bool activationOnly)
             notifiedStates_[job.id] = job.state;
     recorded_ = settings_;
     registry_.discover();
-    auto cache = readJson(stateDir() + "/encoders.json");
-    if (cache["key"].toString() == registry_.cacheKey())
-        registry_.probe();
+    registry_.loadCache();
     setWindowTitle(AppName);
     resize(1180, 800);
     setMinimumSize(760, 520);
@@ -231,6 +244,20 @@ MainWindow::MainWindow(bool activationOnly)
     if (!hotkeys_.assign("toolbar", settings_.overlayHotkey, &error) ||
         !hotkeys_.assign("record", settings_.recordHotkey, &error))
         QTimer::singleShot(0, this, [this, error] { showError(error); });
+    connect(qApp, &QGuiApplication::applicationStateChanged, this, [this](Qt::ApplicationState state) {
+        if (exiting_)
+            return;
+        bool editing = false;
+        if (state == Qt::ApplicationActive)
+            for (auto *widget = QApplication::focusWidget(); widget; widget = widget->parentWidget())
+                if (qobject_cast<QKeySequenceEdit *>(widget)) {
+                    editing = true;
+                    break;
+                }
+        QString error;
+        if (!hotkeys_.setSuspended(editing, &error))
+            status_->setText(error);
+    });
     connect(&hotkeys_, &Hotkeys::activated, this, [this](const QString &c) {
         if (c == "toolbar")
             toolbar_->open();
@@ -286,6 +313,7 @@ MainWindow::MainWindow(bool activationOnly)
         QTimer::singleShot(0, this, [this] { startRecording(true); });
 }
 MainWindow::~MainWindow() {
+    exiting_ = true;
     cancelDiscovery_ = true;
     if (discovery_) {
         discovery_->quit();
@@ -642,24 +670,43 @@ QWidget *MainWindow::settingsPage() {
     auto *shortcutForm = new QFormLayout(shortcuts);
     auto binding = [&](const QString &label, const QString &command, const QString &initial) {
         auto *row = new QWidget;
-        auto *l = new QHBoxLayout(row);
+        auto *column = new QVBoxLayout(row);
+        column->setContentsMargins(0, 0, 0, 0);
+        auto *l = new QHBoxLayout;
         l->setContentsMargins(0, 0, 0, 0);
-        auto *edit = new QKeySequenceEdit(QKeySequence(initial));
+        auto *edit = new ShortcutEdit(QKeySequence(initial), [this](bool capturing) {
+            if (exiting_)
+                return;
+            QString error;
+            if (!hotkeys_.setSuspended(capturing, &error))
+                status_->setText(error);
+        });
+        edit->setObjectName(command + "Shortcut");
+        edit->setAccessibleName(label + " shortcut");
         edit->setMaximumSequenceLength(1);
+        edit->setClearButtonEnabled(true);
         edit->setFont(mono());
         l->addWidget(edit);
-        button("Apply", l, [this, edit, command] {
+        auto *feedback = new QLabel("Active: " + QKeySequence(initial).toString(QKeySequence::NativeText));
+        feedback->setObjectName(command + "ShortcutStatus");
+        feedback->setWordWrap(true);
+        auto *apply = button("Apply", l, [this, edit, command, feedback] {
             QString text = edit->keySequence().toString(QKeySequence::PortableText);
+            auto previous = settings_;
+            auto fail = [this, feedback](const QString &reason) {
+                feedback->setText(reason);
+                feedback->setStyleSheet("color:#f39290");
+                status_->setText(reason);
+            };
             QString error;
             if (command == "ptt") {
                 UINT mods = 0, key = 0;
                 if (!Hotkeys::parse(text, mods, key)) {
-                    showError("Choose a supported push-to-talk binding");
+                    fail("Choose one supported keyboard shortcut.");
                     return;
                 }
                 if (recorder_.active()) {
-                    showError("Stop recording before reassigning push-to-talk so its active binding remains "
-                              "explicit.");
+                    fail("Stop recording before changing push-to-talk. The existing binding remains active.");
                     return;
                 }
                 settings_.pttHotkey = text;
@@ -669,7 +716,7 @@ QWidget *MainWindow::settingsPage() {
                 }
             } else {
                 if (!hotkeys_.assign(command, text, &error)) {
-                    showError(error);
+                    fail(error);
                     return;
                 }
                 if (command == "toolbar")
@@ -677,16 +724,34 @@ QWidget *MainWindow::settingsPage() {
                 else
                     settings_.recordHotkey = text;
             }
-            if (!settings_.save())
-                showError("Could not persist shortcut settings");
-            else
+            if (!settings_.save()) {
+                settings_ = previous;
+                if (command != "ptt") {
+                    const auto original = command == "toolbar" ? previous.overlayHotkey : previous.recordHotkey;
+                    QString rollback;
+                    if (!hotkeys_.assign(command, original, &rollback))
+                        error = " " + rollback;
+                }
+                fail("Could not save the shortcut. Previous settings retained." + error);
+            } else {
+                feedback->setText("Active: " + edit->keySequence().toString(QKeySequence::NativeText));
+                feedback->setStyleSheet("color:#b2edc8");
                 status_->setText("Shortcut applied");
+            }
         });
+        apply->setObjectName(command + "ShortcutApply");
+        apply->setAccessibleName("Apply " + label.toLower() + " shortcut");
+        column->addLayout(l);
+        column->addWidget(feedback);
         shortcutForm->addRow(label, row);
     };
     binding("Clipping toolbar", "toolbar", settings_.overlayHotkey);
     binding("Start / stop recording", "record", settings_.recordHotkey);
     binding("Microphone push-to-talk", "ptt", settings_.pttHotkey);
+    auto *shortcutHint = new QLabel("Focus a shortcut and press your keys, then Tab to Apply. "
+                                   "Changes take effect after Apply; leaving the app restores the active shortcuts.");
+    shortcutHint->setWordWrap(true);
+    shortcutForm->addRow(shortcutHint);
     v->addWidget(shortcuts);
     auto *startup = new QCheckBox("Open SippingCloftware when I sign in to Windows");
     startup->setChecked(settings_.startup);
@@ -907,8 +972,10 @@ void MainWindow::refreshCaptureSources() {
     } else {
         if (recorder_.active())
             recorder_.stop();
-        status_->setText("Hardware/display configuration changed. Capture stopped; rerun encoder tests and "
-                         "calibration. Completed footage retained.");
+        const bool retained = registry_.loadCache();
+        status_->setText(retained
+            ? "Display configuration changed. Capture stopped; encoder tests retained. Recalibrate for automatic capture. Completed footage retained."
+            : "Hardware/display configuration changed. Capture stopped; rerun encoder tests and calibration. Completed footage retained.");
     }
     populateDisplays(display_, registry_.displays, pending.monitorIdentity, pending.monitor);
     settings_.audio = pending.audio;
@@ -990,6 +1057,46 @@ void MainWindow::toggleRecording() {
         return;
     }
     startRecording(false);
+}
+QJsonObject MainWindow::runtimeStatus() {
+    const auto stats = recorder_.stats();
+    const auto profile = stats.active ? recorded_ : readRecording();
+    QJsonArray jobs;
+    const auto all = exports_.jobs();
+    for (int i = qMax(0, int(all.size()) - 20); i < all.size(); ++i) {
+        const auto &job = all[i];
+        jobs.append(QJsonObject{{"id", job.id}, {"state", job.state}, {"terminal", job.terminal},
+                                {"message", job.message}, {"original", job.original}, {"output", job.output}});
+    }
+    return {{"message", status_->text()}, {"stats", stats.json()},
+            {"bufferSeconds", recorder_.buffer().available(recorder_.buffer().latest())},
+            {"profile", QJsonObject{{"encoder", profile.encoder}, {"fps", profile.fps}, {"height", profile.height},
+                                    {"source", profile.source}, {"monitor", profile.monitor},
+                                    {"monitorIdentity", profile.monitorIdentity}, {"container", profile.container},
+                                    {"quality", profile.quality}, {"hdr", profile.hdr}}},
+            {"shortcuts", QJsonObject{{"toolbar", settings_.overlayHotkey}, {"record", settings_.recordHotkey},
+                                      {"pushToTalk", settings_.pttHotkey}, {"editing", hotkeys_.suspended()}}},
+            {"jobs", jobs}};
+}
+QString MainWindow::saveRecent(double seconds) {
+    if (!std::isfinite(seconds) || seconds <= 0 || seconds > 86400)
+        throw std::runtime_error("Clip duration must be between zero and one day");
+    if (!recorder_.active())
+        throw std::runtime_error("Recording is not active. Start recording before saving a recent clip.");
+    auto output = recorded_;
+    output.library = settings_.library;
+    output.folderOverrides = settings_.folderOverrides;
+    output.clipMic = settings_.clipMic;
+    output.clipDesktop = settings_.clipDesktop;
+    const auto source = recorder_.buffer().pin(clockSeconds(), seconds);
+    try {
+        const auto id = exports_.submitSave(source, output);
+        status_->setText("Clip queued with fixed endpoint · " + durationText(source.duration()));
+        return id;
+    } catch (...) {
+        recorder_.buffer().release(source.id);
+        throw;
+    }
 }
 void MainWindow::startRecording(bool atLaunch) {
     if (recorder_.active())

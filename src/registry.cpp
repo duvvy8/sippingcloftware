@@ -204,31 +204,62 @@ void Registry::discover() {
     }
     std::sort(encoders.begin(), encoders.end(), [](const auto &a, const auto &b) { return a.name < b.name; });
 }
-QString Registry::cacheKey() const {
+static QByteArray cacheEnvironment(const QList<Adapter> &adapters) {
     QJsonArray a;
     for (const auto &g : adapters) {
         auto identity = g.json();
         identity.remove("luid"); // Boot-local identifiers do not invalidate unchanged driver tests.
         a << identity;
     }
-    QByteArray bytes = QJsonDocument(a).toJson(QJsonDocument::Compact) + QByteArray(av_version_info()) +
-                       avcodec_configuration() + qVersion() + QByteArray::number(av_get_cpu_flags()) +
-                       "probe-v6-source-identity";
+    return QJsonDocument(a).toJson(QJsonDocument::Compact) + QByteArray(av_version_info()) +
+           avcodec_configuration() + qVersion() + QByteArray::number(av_get_cpu_flags()) +
+           "probe-v6-source-identity";
+}
+QString Registry::cacheKey() const {
+    QByteArray bytes = cacheEnvironment(adapters);
     for (const auto &display : displays)
         bytes += QJsonDocument(display.json()).toJson(QJsonDocument::Compact);
     return QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex();
 }
-void Registry::probe(std::function<void(QString)> progress, std::atomic_bool *cancel, bool useCache) {
+bool Registry::loadCache() {
     auto cache = readJson(stateDir() + "/encoders.json");
-    if (useCache && cache["key"].toString() == cacheKey()) {
-        recommended = cache["recommended"].toString();
-        auto items = cache["encoders"].toArray();
-        for (auto &e : encoders)
-            for (auto v : items)
-                if (v.toObject()["name"].toString() == e.name)
-                    e = EncoderCaps::fromJson(v.toObject());
-        return;
+    const bool exact = cache["key"].toString() == cacheKey();
+    if (!exact) {
+        // Reconstruct the old full key using the stored display configuration
+        // and today's drivers, dependencies and CPU. Equality proves that only
+        // the displays changed, without trusting an unversioned encoder cache.
+        const auto previousDisplays = cache["displays"].toArray();
+        if (previousDisplays.isEmpty())
+            return false;
+        QByteArray previous = cacheEnvironment(adapters);
+        for (const auto &display : previousDisplays)
+            previous += QJsonDocument(display.toObject()).toJson(QJsonDocument::Compact);
+        if (QCryptographicHash::hash(previous, QCryptographicHash::Sha256).toHex() !=
+            cache["key"].toString().toLatin1())
+            return false;
     }
+    recommended = exact ? cache["recommended"].toString() : QString();
+    const auto items = cache["encoders"].toArray();
+    for (auto &encoder : encoders)
+        for (const auto &item : items)
+            if (item.toObject()["name"].toString() == encoder.name) {
+                encoder = EncoderCaps::fromJson(item.toObject());
+                if (!exact) {
+                    encoder.live = false;
+                    QJsonArray synthetic;
+                    for (const auto &test : encoder.tested)
+                        if (!test.toObject().contains("capture"))
+                            synthetic << test;
+                    encoder.tested = synthetic;
+                    if (encoder.encoded)
+                        encoder.reason = "Encoder test retained; display changed. Recalibrate for automatic capture selection.";
+                }
+            }
+    return true;
+}
+void Registry::probe(std::function<void(QString)> progress, std::atomic_bool *cancel, bool useCache) {
+    if (useCache && loadCache())
+        return;
     for (auto &e : encoders) {
         if (cancel && cancel->load())
             break;
@@ -276,10 +307,7 @@ void Registry::probe(std::function<void(QString)> progress, std::atomic_bool *ca
             }
         }
     }
-    QJsonArray a;
-    for (const auto &e : encoders)
-        a << e.json();
-    writeJson(stateDir() + "/encoders.json", {{"key", cacheKey()}, {"encoders", a}});
+    writeJson(stateDir() + "/encoders.json", json());
 }
 QJsonObject Registry::testEncoder(const QString &name, bool hdr) {
     QJsonObject result{{"name", name}, {"initialized", false}, {"encoded", false},

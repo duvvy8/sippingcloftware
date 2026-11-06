@@ -328,3 +328,77 @@ popup/history remains explicitly skipped because the user's Windows notification
 setting is disabled. Existing shell registrations were backed up and restored
 around the tests. Physical HDR/Intel/microphone/Windows 11 support was not newly
 verified here. This PR sync is not completion of the full implementation plan.
+
+## Desktop save and shortcut fixes — 2026-11-06
+
+The requested test was changed from game capture to main-screen desktop capture.
+The running Release app saved a fixed ten-second interval through its persistent
+original-save queue using the user's AV1 NVENC, High, source-resolution, 60 fps
+profile. Recording settings, audio devices, gains, and saved shortcuts were
+compared with the pre-change settings snapshot and retained.
+
+Verified desktop original:
+`C:/Users/Michael/Videos/SippingCloftware/Desktop/2026-11-06_19-21-25-503_29f585d4.mp4`.
+FFprobe reports 2560×1440 AV1, 60/1 fps, 600 frames, exactly 10.000 seconds,
+17,235,982 bytes, and a 48 kHz stereo AAC stream of the same duration. An
+independent full FFmpeg video/audio decode completed with exit 0. A decoded frame
+shows the moving verification window and readable technical text within the
+actual desktop. Recording stats at submission: 3,360 encoded frames, zero queue
+drops, zero backlog, no capture error. Captured-source frames and encoded output
+frames are distinct counters; this does not certify 60 unique source frames per
+second under arbitrary desktop or game load. SHA256 stayed unchanged during
+validation; see `test-output/desktop-clip-sha256.txt`. Originals were retained.
+
+The real test exposed two defects that were fixed. A display change from
+2150×1440 to 2560×1440 discarded valid encoder tests. Cache loading now proves
+that the driver/dependency/CPU/probe identity still matches, retains synthetic
+encoder results, and removes capture calibration/live recommendations when the
+display configuration differs. A changed driver still rejects the cache. The
+second defect counted startup storage work against the recording backlog: storage
+and the first encoder now initialize before the media epoch starts, with fresh
+capture input at that boundary. The two-second runtime backlog guard remains.
+
+Shortcut fields now have accessible names, inline active/conflict feedback and
+native registration suspension while editing, so the app's global shortcuts do
+not intercept the sequence being entered. Leaving the app restores active
+registrations. Apply validates conflicts, saves the preference, and retains the
+previous preference on failure. Ordinary navigation/punctuation/keypad keys are
+mapped explicitly; keypad variants that RegisterHotKey cannot distinguish are
+rejected. Tests exercise edit/apply/persistence, external conflicts, empty input,
+own-action duplicates, native unregister/reregister, and restoring on application
+deactivation. Physical global key delivery through the desktop automation helper
+was not verified; its activation/input operations failed, so no such pass is
+claimed. Existing Ctrl+Shift+S/R bindings remain unchanged.
+
+After the capture/cache/shortcut changes, all seven CTest targets passed in
+58.29 seconds: 27 core cases, media, compression, notifications, and 15 native
+UI cases at each of 100/150/200% scaling. The final keypad-ambiguity guard was
+then rebuilt and its focused core and shortcut UI regressions passed again.
+Logs: `test-output/game-save-build-tests.log`, `desktop-final-build.log`,
+`desktop-final-core.txt`, and `desktop-final-ui.txt`. The capture fixture was
+rebuilt separately and exercised in the actual desktop recording.
+
+**System audio is not certified by this test.** The saved mixed stream decodes
+and contains nonzero audio, but the expected 440 Hz system tone was absent. A
+test source was explicitly mapped to the configured USB headset endpoint;
+waveform rendering returned success and an advancing playback position. Direct
+loopback snapshots at 50 and 250 ms also did not establish the tone. Protected
+video playback was active; Windows documents restrictions on
+[protected-stream loopback capture](https://learn.microsoft.com/en-us/windows/win32/coreaudio/loopback-recording),
+but that has not been isolated as the cause. The user requested finishing without
+further audio testing. No audio settings or capture timing were changed to force
+a pass. Physical microphone quality and long-duration drift remain unverified.
+Test source/tone processes were stopped. Native toast popup/history remains
+skipped because Windows notifications are disabled.
+
+Checklist mapping: H07 (cache identity), C01/C05/C06 (desktop capture, startup
+timing, fixed original save), W01 (editable/persisted shortcuts), A01/A03/A05
+(explicit audio verification limit). This scoped repair does not complete the
+remaining implementation/packaging requirements.
+
+The final command-client check also caught a startup race: a status-only process
+could briefly own the primary lock and make a simultaneously starting app exit.
+Status/save clients now only connect to the user-local server. An immediate query
+during final startup succeeded, and a subsequent query confirmed active AV1 NVENC
+desktop recording with no capture error. The final settings comparison retained
+the original recording profile, audio source configuration and shortcut values.

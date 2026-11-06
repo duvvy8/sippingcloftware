@@ -27,6 +27,24 @@ you can turn that off or choose to launch SippingCloftware when you sign in.
 The HUD's **Mic** and **Desktop Audio** switches control which buffered audio
 goes into the clip you save.
 
+Change bindings in **Settings → Global shortcuts**: focus a shortcut field,
+press the new combination, then Tab to **Apply**. Inline feedback confirms the
+active binding or explains a conflict. Clip/record hotkeys are temporarily
+released while editing so they do not intercept the keys; leaving the app
+restores the active bindings. Push-to-talk changes require recording to stop.
+
+For background verification, a running app also accepts these commands without
+opening its controls or changing the current recording profile:
+
+```powershell
+./build/bin/Release/SippingCloftware.exe --status --result C:/Temp/clipper-status.json
+./build/bin/Release/SippingCloftware.exe --save-clip 10 --result C:/Temp/clipper-save.json
+```
+
+The save command queues the latest requested seconds from the live replay buffer
+through the normal original-save queue. Its JSON result identifies the persistent
+job; it does not enable compression or override the recording settings.
+
 Bootstrap uses Python only to acquire Qt development libraries. Neither Python nor
 Visual Studio is required by the distributed application. An existing matching
 dependency cache can be supplied with `bootstrap.ps1 -CacheRoot <directory>`.

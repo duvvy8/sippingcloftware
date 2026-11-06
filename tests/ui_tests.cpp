@@ -171,6 +171,55 @@ class UiTests : public QObject {
         QTRY_VERIFY(hud->dim_->windowOpacity() > .35);
         QCOMPARE(sample(), QColor("#98cbe4"));
     }
+    void shortcutEditingAndPersistence() {
+        window_->tabs_->setCurrentIndex(2);
+        auto *edit = window_->findChild<QKeySequenceEdit *>("toolbarShortcut");
+        auto *apply = window_->findChild<QPushButton *>("toolbarShortcutApply");
+        auto *feedback = window_->findChild<QLabel *>("toolbarShortcutStatus");
+        QVERIFY(edit && apply && feedback);
+        QVERIFY(edit->accessibleName().contains("Clipping toolbar"));
+        const auto previous = window_->settings_.overlayHotkey;
+        constexpr UINT modifiers = MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT;
+        QFocusEvent focusIn(QEvent::FocusIn, Qt::TabFocusReason);
+        QApplication::sendEvent(edit, &focusIn);
+        QVERIFY(window_->hotkeys_.suspended());
+        QVERIFY(RegisterHotKey(nullptr, 45100, modifiers, VK_F21));
+        QVERIFY(UnregisterHotKey(nullptr, 45100));
+        QTest::keyClick(edit, Qt::Key_F20, Qt::ControlModifier | Qt::AltModifier | Qt::ShiftModifier);
+        QCOMPARE(edit->keySequence().toString(QKeySequence::PortableText), QString("Ctrl+Alt+Shift+F20"));
+        QFocusEvent focusOut(QEvent::FocusOut, Qt::TabFocusReason);
+        QApplication::sendEvent(edit, &focusOut);
+        QVERIFY(!window_->hotkeys_.suspended());
+        QVERIFY(!RegisterHotKey(nullptr, 45100, modifiers, VK_F21));
+        apply->click();
+        QCOMPARE(window_->settings_.overlayHotkey, QString("Ctrl+Alt+Shift+F20"));
+        QCOMPARE(readJson(stateDir() + "/settings.json")["overlayHotkey"].toString(),
+                 QString("Ctrl+Alt+Shift+F20"));
+        QVERIFY(RegisterHotKey(nullptr, 45100, modifiers, VK_F21));
+        QVERIFY(UnregisterHotKey(nullptr, 45100));
+        QVERIFY(!RegisterHotKey(nullptr, 45100, modifiers, VK_F20));
+        QVERIFY(RegisterHotKey(nullptr, 45100, modifiers, VK_F19));
+        edit->setKeySequence(QKeySequence("Ctrl+Alt+Shift+F19"));
+        apply->click();
+        QVERIFY(feedback->text().contains("already registered"));
+        QCOMPARE(window_->settings_.overlayHotkey, QString("Ctrl+Alt+Shift+F20"));
+        QVERIFY(!RegisterHotKey(nullptr, 45101, modifiers, VK_F20));
+        QVERIFY(UnregisterHotKey(nullptr, 45100));
+        edit->clear();
+        apply->click();
+        QVERIFY(feedback->text().contains("supported"));
+        QCOMPARE(window_->settings_.overlayHotkey, QString("Ctrl+Alt+Shift+F20"));
+        edit->setKeySequence(QKeySequence(previous));
+        apply->click();
+        QCOMPARE(window_->settings_.overlayHotkey, previous);
+        QVERIFY(feedback->text().startsWith("Active:"));
+        QApplication::sendEvent(edit, &focusIn);
+        QVERIFY(window_->hotkeys_.suspended());
+        emit qApp->applicationStateChanged(Qt::ApplicationInactive);
+        QVERIFY(!window_->hotkeys_.suspended());
+        QVERIFY(!RegisterHotKey(nullptr, 45100, modifiers, VK_F21));
+        window_->tabs_->setCurrentIndex(0);
+    }
     void libraryPlaybackAndClipboard() {
         sample_ = QDir(window_->settings_.library).filePath("Fixture/sample.mp4");
         QDir().mkpath(QFileInfo(sample_).absolutePath());

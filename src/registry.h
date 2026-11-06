@@ -37,6 +37,7 @@ class Registry {
     void probe(std::function<void(QString)> progress = {}, std::atomic_bool *cancel = nullptr,
                bool useCache = true);
     QString cacheKey() const;
+    bool loadCache();
     QString automatic(bool hdr = false) const;
     const EncoderCaps *find(const QString &) const;
     QString forCodec(int codecId, const QString &preferred = {}, bool hdr = false) const;

@@ -271,6 +271,85 @@ class CoreTests : public QObject {
         QVERIFY(UnregisterHotKey(nullptr, 45001));
         QVERIFY(UnregisterHotKey(nullptr, 45000));
     }
+    void displayChangeKeepsEncoderTestsButInvalidatesCalibration() {
+        QTemporaryDir directory;
+        const auto originalState = qgetenv("CLIPPER_STATE_DIR");
+        auto restore = qScopeGuard([&] {
+            if (originalState.isNull()) qunsetenv("CLIPPER_STATE_DIR");
+            else qputenv("CLIPPER_STATE_DIR", originalState);
+        });
+        qputenv("CLIPPER_STATE_DIR", directory.path().toUtf8());
+        clip::Registry saved;
+        saved.discover();
+        QVERIFY(!saved.displays.isEmpty() && !saved.adapters.isEmpty());
+        bool found = false;
+        for (auto &encoder : saved.encoders)
+            if (encoder.name == "libx264") {
+                encoder.encoded = encoder.initialized = encoder.live = true;
+                encoder.tested = QJsonArray{QJsonObject{{"encoded", true}},
+                                           QJsonObject{{"capture", "test calibration fixture"}}};
+                found = true;
+            }
+        QVERIFY(found);
+        saved.recommended = "libx264";
+        QVERIFY(clip::writeJson(clip::stateDir() + "/encoders.json", saved.json()));
+        clip::Registry current;
+        current.discover();
+        QVERIFY(current.loadCache());
+        QVERIFY(current.find("libx264")->live);
+        current.discover();
+        current.displays[0].width += 2;
+        QVERIFY(current.loadCache());
+        const auto *encoder = current.find("libx264");
+        QVERIFY(encoder && encoder->encoded && !encoder->live);
+        QCOMPARE(encoder->tested.size(), 1);
+        QVERIFY(current.automatic().isEmpty());
+        QVERIFY(current.recommended.isEmpty());
+        current.discover();
+        current.adapters[0].driver += "-changed";
+        QVERIFY(!current.loadCache());
+        QVERIFY(!current.find("libx264")->encoded);
+    }
+    void shortcutCaptureRestoresNativeRegistrations() {
+        clip::Hotkeys keys;
+        QString error;
+        constexpr UINT modifiers = MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT;
+        QVERIFY(keys.assign("toolbar", "Ctrl+Alt+Shift+F23", &error));
+        QVERIFY(keys.assign("record", "Ctrl+Alt+Shift+F24", &error));
+        QVERIFY(!RegisterHotKey(nullptr, 45002, modifiers, VK_F23));
+        QVERIFY(keys.setSuspended(true, &error));
+        QVERIFY(keys.suspended());
+        QVERIFY(RegisterHotKey(nullptr, 45002, modifiers, VK_F23));
+        QVERIFY(UnregisterHotKey(nullptr, 45002));
+        QVERIFY(!keys.assign("toolbar", "Ctrl+Alt+Shift+F24", &error));
+        QVERIFY(keys.setSuspended(false, &error));
+        QVERIFY(!RegisterHotKey(nullptr, 45002, modifiers, VK_F23));
+        QVERIFY(keys.setSuspended(true, &error));
+        QVERIFY(RegisterHotKey(nullptr, 45002, modifiers, VK_F23));
+        QVERIFY(!keys.setSuspended(false, &error));
+        QVERIFY(error.contains("Could not restore"));
+        QVERIFY(UnregisterHotKey(nullptr, 45002));
+        QVERIFY(keys.setSuspended(false, &error));
+        QVERIFY(!RegisterHotKey(nullptr, 45002, modifiers, VK_F23));
+    }
+    void ordinaryShortcutKeys() {
+        UINT modifiers = 0, key = 0;
+        for (const auto &text : {"Ctrl+Delete", "Alt+Left", "Shift+Backspace", "Ctrl+;", "Ctrl+/"})
+            QVERIFY2(clip::Hotkeys::parse(text, modifiers, key), text);
+        QVERIFY(clip::Hotkeys::parse("Ctrl+Delete", modifiers, key));
+        QCOMPARE(key, UINT(VK_DELETE));
+        QCOMPARE(modifiers, UINT(MOD_CONTROL));
+        const auto keypad = QKeySequence(QKeyCombination(Qt::KeypadModifier, Qt::Key_Plus))
+                                .toString(QKeySequence::PortableText);
+        QVERIFY(clip::Hotkeys::parse(keypad, modifiers, key));
+        QCOMPARE(key, UINT(VK_ADD));
+        QCOMPARE(modifiers, UINT(0));
+        const auto keypadEnter = QKeySequence(QKeyCombination(Qt::KeypadModifier, Qt::Key_Enter))
+                                     .toString(QKeySequence::PortableText);
+        QVERIFY(!clip::Hotkeys::parse(keypadEnter, modifiers, key));
+        QVERIFY(!clip::Hotkeys::parse("", modifiers, key));
+        QVERIFY(!clip::Hotkeys::parse("Ctrl+A, Ctrl+B", modifiers, key));
+    }
     void interruptedJobRetainsOriginal() {
         QTemporaryDir dir;
         clip::ExportJob job;

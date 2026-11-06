@@ -321,8 +321,8 @@ void Recorder::run(Settings s, Registry registry) {
                             fullscreenApp = windowApplication(quintptr(window));
                         }
                         frame.fullscreenApp = fullscreenApp;
-                        ++queue.captured;
                         std::lock_guard lock(queue.mutex);
+                        ++queue.captured;
                         if (queue.frames.size() >= 16) {
                             queue.frames.pop_front();
                             ++queue.dropped;
@@ -367,10 +367,47 @@ void Recorder::run(Settings s, Registry registry) {
         int h = s.height > 0 ? s.height : current.height;
         h -= h % 2;
         int w = (current.width * h / current.height) & ~1;
-        double epoch = clockSeconds();
+        // Check pins and retire the previous ring before recovery touches disk.
+        // Startup I/O and codec initialization are outside the recorded timeline.
+        buffer_.begin(0., s.retention, s.bufferBytes);
+        storage.begin(s.bufferFolder, storageToken_);
+        AVPixelFormat pixelFormat = AV_PIX_FMT_NONE;
+        for (const auto &value : cap->tested) {
+            const auto test = value.toObject();
+            if (test["hdr"].toBool() == s.hdr && test.contains("pixelFormat") && test["encoded"].toBool()) {
+                pixelFormat = av_get_pix_fmt(test["pixelFormat"].toString().toUtf8().constData());
+                break;
+            }
+        }
+        if (pixelFormat == AV_PIX_FMT_NONE)
+            throw std::runtime_error("No verified pixel format matches the selected colour mode");
+        const auto openWriter = [&] {
+            QStorageInfo disk(s.bufferFolder);
+            if (disk.bytesAvailable() < 128LL * 1024 * 1024)
+                throw std::runtime_error(
+                    "Replay disk is nearly full. Recording stopped; completed clips were preserved.");
+            writer = std::make_unique<SegmentWriter>();
+            writer->reserve = [this](qint64 bytes) { buffer_.reserve(bytes); };
+            buffer_.reserve(2 * 1024 * 1024);
+            writer->open(storage.reserve(), s, w, h, trackRoles, pixelFormat);
+            storage.identifyActive();
+        };
+        openWriter();
+        if (stop_)
+            throw std::runtime_error("Recording cancelled during initialization");
+        const double epoch = clockSeconds();
         segmentStart = epoch;
         buffer_.begin(epoch, s.retention, s.bufferBytes);
-        storage.begin(s.bufferFolder, storageToken_);
+        buffer_.reserve(2 * 1024 * 1024);
+        {
+            std::lock_guard lock(queue.mutex);
+            if (!queue.frames.empty()) {
+                current = std::move(queue.frames.back());
+                queue.frames.clear();
+            }
+            queue.captured = 1;
+            queue.dropped = 0;
+        }
         qint64 totalFrames = 0, totalSamples = 0;
         {
             std::lock_guard lock(mutex_);
@@ -406,28 +443,9 @@ void Recorder::run(Settings s, Registry registry) {
             }
             if (!audio.error().isEmpty())
                 throw std::runtime_error(audio.error().toStdString());
-            if (totalFrames % (s.fps * 2) == 0) {
-                QStorageInfo disk(s.bufferFolder);
-                if (disk.bytesAvailable() < 128LL * 1024 * 1024)
-                    throw std::runtime_error(
-                        "Replay disk is nearly full. Recording stopped; completed clips were preserved.");
-                writer = std::make_unique<SegmentWriter>();
-                writer->reserve = [this](qint64 bytes) { buffer_.reserve(bytes); };
-                buffer_.reserve(2 * 1024 * 1024);
+            if (!writer) {
                 segmentStart = target;
-                AVPixelFormat pixelFormat = AV_PIX_FMT_NONE;
-                for (auto value : cap->tested) {
-                    auto test = value.toObject();
-                    if (test["hdr"].toBool() == s.hdr && test.contains("pixelFormat") &&
-                        test["encoded"].toBool()) {
-                        pixelFormat = av_get_pix_fmt(test["pixelFormat"].toString().toUtf8().constData());
-                        break;
-                    }
-                }
-                if (pixelFormat == AV_PIX_FMT_NONE)
-                    throw std::runtime_error("No verified pixel format matches the selected colour mode");
-                writer->open(storage.reserve(), s, w, h, trackRoles, pixelFormat);
-                storage.identifyActive();
+                openWriter();
             }
             writer->addVideo(current);
             qint64 nextSamples = qRound64(double(totalFrames + 1) * 48000 / s.fps);

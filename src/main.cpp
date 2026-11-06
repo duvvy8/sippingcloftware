@@ -17,6 +17,37 @@ int main(int argc, char **argv) {
         int i = args.indexOf(k);
         return i >= 0 ? args.value(i + 1) : QString();
     };
+    if (args.contains("--status") || args.contains("--save-clip")) {
+        const auto destination = value("--result");
+        if (!QFileInfo(destination).isAbsolute())
+            return 2;
+        const auto request = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        clip::Instance client;
+        QString error;
+        // A read/control client must never acquire the primary-instance lock:
+        // doing so can make a concurrently starting application exit as secondary.
+        QJsonObject message{{"command", args.contains("--save-clip") ? "save-clip" : "status"},
+                            {"result", destination}, {"request", request}};
+        if (args.contains("--save-clip")) {
+            bool valid = false;
+            const double seconds = value("--save-clip").toDouble(&valid);
+            if (!valid || seconds <= 0 || seconds > 86400) {
+                clip::writeJson(destination, {{"error", "Provide a clip duration in seconds, from 0 to 86400"}});
+                return 2;
+            }
+            message["seconds"] = seconds;
+        }
+        if (!client.forward(message, &error, 30000)) {
+            clip::writeJson(destination, {{"error", error}});
+            return 1;
+        }
+        const auto report = clip::readJson(destination);
+        if (report["request"].toString() != request) {
+            clip::writeJson(destination, {{"error", "The running application does not support this request"}});
+            return 1;
+        }
+        return report.contains("error") ? 1 : 0;
+    }
     if (args.contains("--probe")) {
         auto result = clip::Registry::testEncoder(value("--probe"), args.contains("--hdr"));
         clip::writeJson(value("--result"), result);
@@ -136,6 +167,21 @@ int main(int argc, char **argv) {
                 window.exitApplication();
             else if (message["command"].toString() == "show")
                 window.showControls();
+            else if (message["command"] == "status" || message["command"] == "save-clip") {
+                const auto destination = message["result"].toString();
+                if (!QFileInfo(destination).isAbsolute())
+                    return;
+                QJsonObject report;
+                try {
+                    if (message["command"] == "save-clip")
+                        report["job"] = window.saveRecent(message["seconds"].toDouble());
+                    report["status"] = window.runtimeStatus();
+                } catch (const std::exception &e) {
+                    report["error"] = QString::fromUtf8(e.what());
+                }
+                report["request"] = message["request"];
+                clip::writeJson(destination, report);
+            }
         });
         QObject::connect(&window, &clip::MainWindow::clipSaved, &window, [&](const QString &id, const QJsonObject &media) {
             QString reason;
