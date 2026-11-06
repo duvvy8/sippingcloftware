@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "editor.h"
 #include <QtTest>
+#include <algorithm>
 #include <shellapi.h>
 namespace clip {
 class UiTests : public QObject {
@@ -15,6 +16,8 @@ class UiTests : public QObject {
         applyAppearance(*qobject_cast<QApplication *>(QCoreApplication::instance()));
         QApplication::setQuitOnLastWindowClosed(false);
         Settings settings;
+        settings.autoRecord = false;
+        settings.notifications = false;
         settings.library = temporary_.filePath("clips");
         settings.bufferFolder = temporary_.filePath("buffer");
         settings.overlayHotkey = "Ctrl+Alt+Shift+F21";
@@ -47,13 +50,117 @@ class UiTests : public QObject {
         QVERIFY(window_->grab().save("test-output/ui-" + scale + ".png"));
     }
     void toolbarDismissAndPartialState() {
+        window_->hide();
+        auto restore = qScopeGuard([&] {
+            window_->toolbar_->hide();
+            window_->show();
+        });
         window_->toolbar_->open();
         QVERIFY(window_->toolbar_->isVisible());
+        QVERIFY(!window_->isVisible());
         QVERIFY(!window_->toolbar_->save_->isEnabled());
         QVERIFY(!window_->toolbar_->compress_->isEnabled());
-        QTest::keyClick(window_->toolbar_, Qt::Key_Escape);
+        QVERIFY(window_->toolbar_->mic_->isChecked());
+        QVERIFY(window_->toolbar_->desktop_->isChecked());
+        QTRY_VERIFY_WITH_TIMEOUT(
+            window_->toolbar_->screen()->availableGeometry().contains(window_->toolbar_->geometry()), 500);
+        QCOMPARE(window_->toolbar_->save_->width(), window_->toolbar_->record_->width());
+        QVERIFY(window_->toolbar_->height() < 400);
+        DWORD hudAffinity = 0;
+        QVERIFY(GetWindowDisplayAffinity(HWND(window_->toolbar_->winId()), &hudAffinity));
+        QCOMPARE(hudAffinity, DWORD(WDA_EXCLUDEFROMCAPTURE));
+        if (window_->toolbar_->dim_->isVisible()) {
+            DWORD affinity = 0;
+            QVERIFY(GetWindowDisplayAffinity(HWND(window_->toolbar_->dim_->winId()), &affinity));
+            QCOMPARE(affinity, DWORD(WDA_EXCLUDEFROMCAPTURE));
+        }
+        auto *hud = window_->toolbar_;
+        const auto controls = hud->findChildren<QPushButton *>();
+        const auto more = std::find_if(controls.begin(), controls.end(), [](auto *control) {
+            return control->accessibleName() == "More clip options";
+        });
+        QVERIFY(more != controls.end());
+        QTest::mouseClick(*more, Qt::LeftButton);
+        QVERIFY(hud->advanced_->isVisible());
+        QCOMPARE(hud->advanced_->window(), hud);
+        hud->duration_->showPopup();
+        QCOMPARE(hud->advancedPages_->currentIndex(), 1);
+        auto *choices = hud->findChild<QListView *>("hudAdvancedChoices");
+        QVERIFY(choices && choices->isVisible());
+        QCOMPARE(choices->window(), hud);
+        const auto first = choices->model()->index(0, 0);
+        QTest::mouseClick(choices->viewport(), Qt::LeftButton, Qt::NoModifier,
+                          choices->visualRect(first).center());
+        QCOMPARE(hud->duration_->currentData().toInt(), 10);
+        QCOMPARE(hud->advancedPages_->currentIndex(), 0);
+        QTest::keyClick(hud, Qt::Key_Escape);
         QVERIFY(!window_->toolbar_->isVisible());
+        QVERIFY(!window_->toolbar_->dim_->isVisible());
         QCOMPARE(window_->toolbar_->pin_.id, QString());
+        hud->open();
+        QVERIFY(hud->isVisible());
+        emit qApp->applicationStateChanged(Qt::ApplicationInactive);
+        QVERIFY(!hud->isVisible());
+        QVERIFY(!hud->dim_->isVisible());
+    }
+    void dimmerStaysOutOfDxgiCapture() {
+        const auto foreground = GetForegroundWindow();
+        const auto monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFOEXW details{};
+        details.cbSize = sizeof(details);
+        QVERIFY(GetMonitorInfoW(monitor, &details));
+        QScreen *screen = nullptr;
+        for (auto *candidate : QGuiApplication::screens())
+            if (candidate->name() == QString::fromWCharArray(details.szDevice)) {
+                screen = candidate;
+                break;
+            }
+        QVERIFY(screen);
+        QWidget fixture(nullptr, Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
+        fixture.setAttribute(Qt::WA_ShowWithoutActivating);
+        fixture.setStyleSheet("background:#98cbe4");
+        const auto area = screen->availableGeometry();
+        fixture.setGeometry(area.left(), area.center().y() - 185, 380, 370);
+        fixture.show();
+        fixture.raise();
+        auto *hud = window_->toolbar_;
+        const auto close = qScopeGuard([&] { hud->hide(); });
+        Settings settings;
+        settings.backend = "dxgi";
+        settings.monitor = -1;
+        for (int i = 0; i < window_->registry_.displays.size(); ++i)
+            if (window_->registry_.displays[i].handle == quintptr(monitor))
+                settings.monitor = i;
+        QVERIFY(settings.monitor >= 0);
+        if (window_->registry_.displays[settings.monitor].hdr)
+            QSKIP("DXGI pixel check requires an SDR display");
+        Capture capture;
+        capture.open(settings, window_->registry_);
+        POINT point{300, 150};
+        QVERIFY(ClientToScreen(HWND(fixture.winId()), &point));
+        point.x -= details.rcMonitor.left;
+        point.y -= details.rcMonitor.top;
+        const auto sample = [&]() -> QColor {
+            CapturedFrame frame;
+            QElapsedTimer timer;
+            timer.start();
+            while (timer.elapsed() < 1800) {
+                if (capture.next(frame) && point.x >= 0 && point.x < frame.width && point.y >= 0 &&
+                    point.y < frame.height) {
+                    const auto *pixel = reinterpret_cast<const uchar *>(frame.pixels.constData()) +
+                                        point.y * frame.stride + point.x * 4;
+                    return QColor(pixel[2], pixel[1], pixel[0]);
+                }
+                QTest::qWait(12);
+            }
+            return {};
+        };
+        QTRY_COMPARE_WITH_TIMEOUT(sample(), QColor("#98cbe4"), 2500);
+        hud->open();
+        QVERIFY(hud->dim_->isVisible());
+        QCOMPARE(hud->dim_->screen(), screen);
+        QTRY_VERIFY(hud->dim_->windowOpacity() > .35);
+        QCOMPARE(sample(), QColor("#98cbe4"));
     }
     void libraryPlaybackAndClipboard() {
         sample_ = QDir(window_->settings_.library).filePath("Fixture/sample.mp4");
@@ -242,9 +349,51 @@ class UiTests : public QObject {
         QVERIFY(window_->toolbar_->isVisible());
         QVERIFY(window_->toolbar_->save_->isEnabled());
         double endpoint = window_->toolbar_->endpoint_;
-        QTest::qWait(300);
+        const auto jobCount = window_->exports_.jobs().size();
+        QTest::mouseClick(window_->toolbar_->mic_, Qt::LeftButton);
+        QVERIFY(!window_->toolbar_->mic_->isChecked());
+        QVERIFY(window_->toolbar_->desktop_->isChecked());
+        QTest::mouseClick(window_->toolbar_->compress_, Qt::LeftButton);
+        QVERIFY(window_->toolbar_->compress_->isChecked());
+        QVERIFY(window_->toolbar_->isVisible());
+        QCOMPARE(window_->exports_.jobs().size(), jobCount);
+        QCOMPARE(window_->toolbar_->endpoint_, endpoint);
+        QTest::mouseClick(window_->toolbar_->compress_, Qt::LeftButton);
+        QVERIFY(!window_->toolbar_->compress_->isChecked());
+        const auto presets = window_->toolbar_->findChildren<QPushButton *>();
+        const auto rateChoices = std::find_if(presets.begin(), presets.end(), [](const auto *button) {
+            return button->accessibleName() == "Frame rate choices";
+        });
+        QVERIFY(rateChoices != presets.end());
+        QCOMPARE((*rateChoices)->text(), QString("30 fps"));
+        QTest::mouseClick(*rateChoices, Qt::LeftButton);
+        QVERIFY(window_->toolbar_->options_->isVisible());
+        auto *options = window_->toolbar_->options_;
+        QCOMPARE(options->window(), window_->toolbar_);
+        QVERIFY(window_->toolbar_->screen()->availableGeometry().contains(
+            QRect(options->mapToGlobal(QPoint()), options->size())));
+        DWORD optionsAffinity = 0;
+        QVERIFY(GetWindowDisplayAffinity(HWND(options->window()->winId()), &optionsAffinity));
+        QCOMPARE(optionsAffinity, DWORD(WDA_EXCLUDEFROMCAPTURE));
+        QTRY_VERIFY(!window_->toolbar_->mask().contains(
+            QPoint(window_->toolbar_->rail_->width() + 3, options->y() + options->height() / 2)));
+        const auto rate = std::find_if(presets.begin(), presets.end(), [](const auto *button) {
+            return button->accessibleName() == "Frame rate: 15 fps";
+        });
+        QVERIFY(rate != presets.end());
+        auto *highlight = (*rate)->parentWidget()->findChild<QWidget *>("clipSelection");
+        QVERIFY(highlight);
+        QVERIFY(highlight->y() != (*rate)->y());
+        QTest::mouseClick(*rate, Qt::LeftButton);
+        QVERIFY((*rate)->isChecked());
+        QCOMPARE(window_->toolbar_->fps_->currentData().toInt(), 15);
+        QCOMPARE((*rateChoices)->text(), QString("15 fps"));
+        QTRY_COMPARE_WITH_TIMEOUT(highlight->geometry(), (*rate)->geometry().adjusted(0, 2, 0, -2), 500);
+        QSignalSpy saved(&window_->exports_, &ExportQueue::clipSaved);
         QTest::mouseClick(window_->toolbar_->save_, Qt::LeftButton);
         QVERIFY(!window_->toolbar_->isVisible());
+        QVERIFY(!window_->toolbar_->options_->isVisible());
+        QVERIFY(!window_->toolbar_->dim_->isVisible());
         QCOMPARE(window_->toolbar_->pin_.id, QString());
         QTest::qWait(200);
         movement.stop();
@@ -255,9 +404,18 @@ class UiTests : public QObject {
                                      window_->exports_.jobs().last().terminal,
                                  30000);
         auto job = window_->exports_.jobs().last();
+        QVERIFY(!job.settings.clipMic);
+        QVERIFY(job.settings.clipDesktop);
         QVERIFY2(job.state == "Complete", qPrintable(job.message));
         QCOMPARE(job.source.end, endpoint);
         auto media = inspect(job.original);
+        QTRY_COMPARE(saved.size(), 1);
+        QCOMPARE(saved.first().at(0).toString(), job.id);
+        QCOMPARE(saved.first().at(1).toJsonObject(), media.json());
+        QCOMPARE(QFileInfo(job.original).dir().dirName(), QString("Desktop"));
+        QVERIFY(!QFileInfo::exists(job.original + ".clip.json"));
+        QCOMPARE(readClipMetadata(job.settings.library, job.original)["media"].toObject(), media.json());
+        QCOMPARE(media.fps, 15.);
         QVERIFY(qAbs(media.duration - job.source.duration()) <= 1. / media.fps + .001);
         QVERIFY(decodeValidate(job.original));
         QVERIFY(window_->recorder_.stats().backlog == 0);
@@ -266,16 +424,21 @@ class UiTests : public QObject {
     }
     void restartApprovalAndCaptureCalibration() {
         window_->populateEncoders();
-        window_->encoder_->setCurrentIndex(window_->encoder_->findData("libx264"));
+        window_->encoder_->setCurrentIndex(window_->encoder_->findData("auto"));
         window_->source_->setCurrentIndex(window_->source_->findData("monitor"));
         window_->recordFps_->setCurrentIndex(window_->recordFps_->findData(30));
         window_->recordHeight_->setCurrentIndex(window_->recordHeight_->findData(480));
-        auto settings = window_->readRecording();
-        window_->recorded_ = settings;
-        window_->recorder_.start(settings, window_->registry_);
+        window_->startRecording(true);
+        QVERIFY2(window_->recorder_.active(), qPrintable(window_->status_->text()));
         auto stop = qScopeGuard([&] { window_->recorder_.stop(); });
         QTest::qWait(250);
         auto initial = window_->recorder_.stats();
+        QCOMPARE(initial.encoder, QString("libx264"));
+        QCOMPARE(initial.backend, QString("DXGI Desktop Duplication"));
+        window_->toolbar_->open();
+        QVERIFY(window_->toolbar_->dim_->isVisible());
+        window_->toolbar_->hide();
+        window_->encoder_->setCurrentIndex(window_->encoder_->findData("libx264"));
         window_->recordFps_->setCurrentIndex(window_->recordFps_->findData(15));
         QTimer response;
         response.setInterval(10);

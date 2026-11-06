@@ -122,6 +122,23 @@ void Capture::open(const Settings &s, const Registry &r) {
     check_hresult(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
                                     D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
                                     &p.device, &level, &p.context));
+    const auto openDuplication = [&] {
+        ComPtr<IDXGIOutput> output;
+        check_hresult(adapter->EnumOutputs(UINT(display.output), &output));
+        ComPtr<IDXGIOutput1> duplication;
+        check_hresult(output.As(&duplication));
+        check_hresult(duplication->DuplicateOutput(p.device.Get(), &p.duplication));
+        p.width = display.width;
+        p.height = display.height;
+        p.backend = "DXGI Desktop Duplication";
+    };
+    if (s.backend == "wgc" && s.borderlessDisplay && s.source == "monitor" && !p.floating)
+        try {
+            openDuplication();
+            return;
+        } catch (const hresult_error &) {
+            // Keep capture available if desktop duplication is unavailable on this display.
+        }
     if (s.backend == "wgc")
         try {
             if (!GraphicsCaptureSession::IsSupported())
@@ -167,14 +184,9 @@ void Capture::open(const Settings &s, const Registry &r) {
     if (p.floating)
         throw std::runtime_error("An HDR display requires floating-point Windows Graphics Capture; DXGI "
                                  "fallback cannot preserve or tone-map it");
-    ComPtr<IDXGIOutput> o;
-    check_hresult(adapter->EnumOutputs(UINT(display.output), &o));
-    ComPtr<IDXGIOutput1> o1;
-    check_hresult(o.As(&o1));
-    check_hresult(o1->DuplicateOutput(p.device.Get(), &p.duplication));
-    p.width = display.width;
-    p.height = display.height;
-    p.backend = "DXGI Desktop Duplication (SDR monitor fallback)";
+    openDuplication();
+    if (s.backend == "wgc")
+        p.backend += " (SDR monitor fallback)";
 }
 bool Capture::next(CapturedFrame &out) {
     auto &p = *impl_;

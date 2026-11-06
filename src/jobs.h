@@ -32,11 +32,10 @@ class ExportQueue : public QObject {
   public:
     explicit ExportQueue(ReplayBuffer *, QObject *parent = nullptr, QString storage = {});
     ~ExportQueue();
-    QString submitSave(const Interval &, const Settings &, const QString &application,
-                       const QString &executable, bool compress = false);
-    QString submitCompression(const QString &original, const QString &encoder);
+    QString submitSave(const Interval &, const Settings &, bool compress = false);
+    QString submitCompression(const QString &original, const QString &encoder, const QString &library = {});
     QString submitEdit(const QString &original, const EditRequest &, const QString &encoder,
-                       const QString &quality);
+                       const QString &quality, const QString &library = {});
     QList<ExportJob> jobs() const;
     void cancel(const QString &);
     bool retryCopy(const QString &, QString *error = nullptr);
@@ -44,6 +43,7 @@ class ExportQueue : public QObject {
     void shutdown();
   signals:
     void jobChanged(QString id);
+    void clipSaved(QString id, QJsonObject media);
     void queueError(QString reason);
 };
 } // namespace clip

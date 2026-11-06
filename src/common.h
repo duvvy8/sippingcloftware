@@ -18,12 +18,15 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 namespace clip {
+inline constexpr char AppName[] = "SippingCloftware";
 constexpr qint64 SizeLimit = 20000000, TargetSize = 19500000;
 QString avError(int code);
 void check(int code, const char *context);
 double clockSeconds();
 double processCpuSeconds();
 QString stateDir();
+QString defaultClipLibrary();
+QString legacyClipLibrary();
 bool writeJson(const QString &path, const QJsonObject &object);
 QJsonObject readJson(const QString &path);
 QString safeName(QString value);
@@ -55,7 +58,8 @@ struct Settings {
     int monitor = 0, fps = 60, height = 0, retention = 300;
     quintptr window = 0;
     qint64 bufferBytes = 4LL * 1024 * 1024 * 1024;
-    bool hdr = false, toneMapCapture = false, startup = false, autoRecord = false, notifications = true;
+    bool hdr = false, toneMapCapture = false, startup = false, autoRecord = true, notifications = true;
+    bool borderlessDisplay = true, clipMic = true, clipDesktop = true;
     QString overlayHotkey = "Ctrl+Shift+S", recordHotkey = "Ctrl+Shift+R", pttHotkey = "V";
     QList<AudioSource> audio;
     QMap<QString, QString> folderOverrides;

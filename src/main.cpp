@@ -9,7 +9,7 @@
 #include <QMainWindow>
 int main(int argc, char **argv) {
     QApplication app(argc, argv);
-    QCoreApplication::setApplicationName("DesktopClipper");
+    QCoreApplication::setApplicationName(clip::AppName);
     QCoreApplication::setOrganizationName("Local");
     av_log_set_level(AV_LOG_ERROR);
     const QStringList args = app.arguments();
@@ -42,6 +42,7 @@ int main(int argc, char **argv) {
             s.fps = 60;
             s.height = 720;
             s.backend = args.contains("--dxgi") ? "dxgi" : "wgc";
+            s.borderlessDisplay = args.contains("--dxgi");
             QTemporaryDir buffer;
             s.bufferFolder = buffer.path();
             s.retention = 8;
@@ -104,13 +105,17 @@ int main(int argc, char **argv) {
         clip::applyAppearance(app);
         app.setQuitOnLastWindowClosed(false);
         const bool activation = args.contains("--notification-server");
+        const bool showControls = args.contains("--show") || !QSystemTrayIcon::isSystemTrayAvailable();
         clip::Instance instance;
         QString error;
         bool primary = instance.acquire(&error);
         if (args.contains("--exit"))
             return primary ? 0 : instance.forward({{"command", "exit"}}, &error) ? 0 : 1;
         if (!primary && !activation)
-            return instance.forward({{"command", "show"}}, &error) ? 0 : 1;
+            return showControls && !instance.forward({{"command", "show"}}, &error) ? 1 : 0;
+        if (primary && !activation && !qEnvironmentVariableIsSet("CLIPPER_STATE_DIR") &&
+            !clip::Notifications::registerShell(true, &error))
+            qWarning("Windows notification setup: %s", qPrintable(error));
         clip::Notifications notifications;
         if (!primary) {
             QObject::connect(&notifications, &clip::Notifications::activated, &app, [&](QString arguments) {
@@ -129,11 +134,13 @@ int main(int argc, char **argv) {
                 window.handleNotificationAction(message["arguments"].toString());
             else if (message["command"].toString() == "exit")
                 window.exitApplication();
-            else if (message["command"].toString() == "show") {
-                window.showNormal();
-                window.raise();
-                window.activateWindow();
-            }
+            else if (message["command"].toString() == "show")
+                window.showControls();
+        });
+        QObject::connect(&window, &clip::MainWindow::clipSaved, &window, [&](const QString &id, const QJsonObject &media) {
+            QString reason;
+            if (window.notificationsEnabled() && !notifications.showSaved(id, media, &reason))
+                qWarning("Native notification: %s", qPrintable(reason));
         });
         QObject::connect(&window, &clip::MainWindow::notificationReady, &window, [&](QString id) {
             if (!window.notificationsEnabled())
@@ -145,8 +152,8 @@ int main(int argc, char **argv) {
                         qWarning("Native notification: %s", qPrintable(reason));
                 }
         });
-        if (!args.contains("--background") && !activation)
-            window.show();
+        if (!activation && showControls)
+            window.showControls();
         return app.exec();
     } catch (const winrt::hresult_error &e) {
         QMessageBox::critical(nullptr, "Startup failed", QString::fromWCharArray(e.message().c_str()));

@@ -2,11 +2,16 @@
 #include "common.h"
 #include <condition_variable>
 namespace clip {
+struct FullscreenSpan {
+    double start = 0, end = 0;
+    QString application, executable;
+};
 struct Segment {
     QString path;
     double start = 0, end = 0;
     qint64 bytes = 0;
     QJsonObject identity;
+    QList<FullscreenSpan> fullscreen;
 };
 struct Interval {
     QString id;

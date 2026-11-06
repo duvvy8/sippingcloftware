@@ -53,12 +53,19 @@ class NotificationTests : public QObject {
         job.terminal = true;
         job.state = "Complete";
         job.kind = "compress";
-        job.details = {{"copied", true}, {"deleteDecision", "Pending"}};
+        const QJsonObject media{{"bytes", 19800000}, {"width", 1280}, {"height", 720},
+                                {"fps", 30}, {"duration", 60}};
+        job.details = {{"copied", true}, {"deleteDecision", "Pending"}, {"outputMedia", media}};
         auto xml = clip::notificationXml(job);
-        QVERIFY(xml.contains("File compressed and copied to clipboard. Delete unreduced file?"));
+        QVERIFY(xml.contains("Compressed to 19.80 MB"));
+        QVERIFY(xml.contains("Copied to clipboard. Delete original?"));
         QVERIFY(xml.contains("content=\"Yes\""));
         QVERIFY(xml.contains("content=\"No\""));
         QVERIFY(xml.contains("&amp;action=yes"));
+        auto saved = clip::savedNotificationXml(job.id, media);
+        QVERIFY(saved.contains("Clip Saved"));
+        QVERIFY(saved.contains("19.80 MB"));
+        QVERIFY(saved.contains("action=open-original"));
         job.state = "Already within limit";
         job.details["alreadySmall"] = true;
         QVERIFY(!clip::notificationXml(job).contains("<actions>"));
@@ -211,7 +218,7 @@ class NotificationTests : public QObject {
         if (policy.value("ToastEnabled", 1).toInt() == 0)
             QSKIP("Windows global notifications are disabled by the user's settings. Native popup/history "
                   "delivery remains unverified; do not change system preferences for this test.");
-        QString exe = QCoreApplication::applicationDirPath() + "/clipper.exe";
+        QString exe = QCoreApplication::applicationDirPath() + '/' + clip::AppName + ".exe";
         auto registration = clip::runProcess(
             exe, {"--register-shell", "--result", temporary_.filePath("toast-shell.json")}, 10000);
         QVERIFY2(registration.code == 0,
@@ -224,19 +231,27 @@ class NotificationTests : public QObject {
         auto cleanup = qScopeGuard([&] {
             try {
                 history.Remove(job.id.left(16).toStdWString(), L"exports", clip::Notifications::AppId);
+                history.Remove(job.id.left(16).toStdWString(), L"saves", clip::Notifications::AppId);
             } catch (...) {
             }
         });
         QString error;
+        const QJsonObject media{{"bytes", 19800000}, {"width", 1280}, {"height", 720},
+                                {"fps", 30}, {"duration", 60}};
+        job.details["outputMedia"] = media;
+        QVERIFY2(notifications.showSaved(job.id, media, &error, true), qPrintable(error));
         QVERIFY2(notifications.show(job, &error, true), qPrintable(error));
         auto present = [&] {
+            bool saved = false, compressed = false;
             for (const auto &toast : history.GetHistory(clip::Notifications::AppId))
                 if (QString::fromWCharArray(toast.Tag().c_str()) == job.id.left(16)) {
                     auto xml = QString::fromWCharArray(toast.Content().GetXml().c_str());
-                    return xml.contains("File compressed and copied to clipboard. Delete unreduced file?") &&
-                           xml.contains("content=\"Yes\"") && xml.contains("content=\"No\"");
+                    saved |= xml.contains("Clip Saved") && xml.contains("19.80 MB");
+                    compressed |= xml.contains("Compressed to 19.80 MB") &&
+                                  xml.contains("Copied to clipboard. Delete original?") &&
+                                  xml.contains("content=\"Yes\"") && xml.contains("content=\"No\"");
                 }
-            return false;
+            return saved && compressed;
         };
         QTRY_VERIFY_WITH_TIMEOUT(present(), 5000);
     }
@@ -250,7 +265,7 @@ class NotificationTests : public QObject {
         settings.overlayHotkey = "Ctrl+Alt+Shift+F23";
         settings.recordHotkey = "Ctrl+Alt+Shift+F24";
         QVERIFY(settings.save());
-        QString exe = QCoreApplication::applicationDirPath() + "/clipper.exe";
+        QString exe = QCoreApplication::applicationDirPath() + '/' + clip::AppName + ".exe";
         auto registration =
             clip::runProcess(exe, {"--register-shell", "--result", temporary_.filePath("shell.json")}, 10000);
         QVERIFY2(registration.code == 0,

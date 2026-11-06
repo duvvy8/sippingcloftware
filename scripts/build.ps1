@@ -13,7 +13,7 @@ $generator = if ($vs -match '\\18\\') { 'Visual Studio 18 2026' } else { 'Visual
 if ($LASTEXITCODE) { throw 'CMake configure failed' }
 & $cmake --build "$root\build" --config $Configuration --parallel
 if ($LASTEXITCODE) { throw 'Compile failed' }
-& "$qt\bin\windeployqt.exe" --release --no-translations --no-compiler-runtime "$root\build\bin\$Configuration\clipper.exe"
+& "$qt\bin\windeployqt.exe" --release --no-translations --no-compiler-runtime "$root\build\bin\$Configuration\SippingCloftware.exe"
 if ($LASTEXITCODE) { throw 'Qt deployment failed' }
 & (Join-Path (Split-Path $cmake) 'ctest.exe') --test-dir "$root\build" -C $Configuration --output-on-failure
 if ($LASTEXITCODE) { throw 'Tests failed' }

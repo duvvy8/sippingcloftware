@@ -36,7 +36,7 @@ struct SegmentWriter {
         if (!finalized && !path.isEmpty())
             QFile::remove(path);
     }
-    void open(const QString &p, const Settings &s, int width, int height, int tracks,
+    void open(const QString &p, const Settings &s, int width, int height, const QStringList &trackRoles,
               AVPixelFormat pixelFormat) {
         path = p;
         fps = s.fps;
@@ -69,7 +69,7 @@ struct SegmentWriter {
         videoStream->time_base = c->time_base;
         videoStream->avg_frame_rate = c->framerate;
         check(avcodec_parameters_from_context(videoStream->codecpar, c), "Video parameters");
-        for (int i = 0; i < tracks; ++i) {
+        for (int i = 0; i < trackRoles.size(); ++i) {
             auto ac = avcodec_find_encoder(AV_CODEC_ID_FLAC);
             if (!ac)
                 throw std::runtime_error("FLAC buffer audio encoder missing");
@@ -86,6 +86,7 @@ struct SegmentWriter {
             check(avcodec_parameters_from_context(stream->codecpar, a.get()), "Audio parameters");
             av_dict_set(&stream->metadata, "title",
                         i == 0 ? "Compatibility mix" : qPrintable(QString("Source %1").arg(i)), 0);
+            av_dict_set(&stream->metadata, "sipping_audio_role", qPrintable(trackRoles[i]), 0);
             audioStreams.push_back(stream);
             audio.push_back(std::move(a));
             pending.emplace_back();
@@ -266,12 +267,13 @@ void Recorder::run(Settings s, Registry registry) {
     ReplayStorage storage;
     std::unique_ptr<SegmentWriter> writer;
     double segmentStart = 0;
+    QList<FullscreenSpan> fullscreen;
     auto commit = [&] {
         if (writer && writer->frames) {
             int count = writer->frames;
             writer->finish();
             buffer_.add({writer->path, segmentStart, segmentStart + double(count) / s.fps,
-                         QFileInfo(writer->path).size()});
+                         QFileInfo(writer->path).size(), {}, std::exchange(fullscreen, {})});
             storage.committed(buffer_.segments());
             writer.reset();
         }
@@ -295,6 +297,7 @@ void Recorder::run(Settings s, Registry registry) {
         if (initialDisk.bytesAvailable() < 128LL * 1024 * 1024)
             throw std::runtime_error("Insufficient replay storage: at least 128 MiB free is required");
         audio.start(s.audio);
+        const auto trackRoles = audio.trackRoles();
         capture = std::thread([&] {
             winrt::init_apartment(winrt::apartment_type::multi_threaded);
             try {
@@ -305,9 +308,19 @@ void Recorder::run(Settings s, Registry registry) {
                     queue.backend = source.backend();
                 }
                 queue.ready = true;
+                const auto monitor = HMONITOR(registry.displays[s.monitor].handle);
+                const auto windowCapture = s.source == "window" ? HWND(s.window) : nullptr;
+                HWND lastFullscreen = nullptr;
+                ApplicationIdentity fullscreenApp;
                 while (!queue.stop) {
                     CapturedFrame frame;
                     if (source.next(frame)) {
+                        const auto window = fullscreenCaptureWindow(monitor, windowCapture);
+                        if (window != lastFullscreen) {
+                            lastFullscreen = window;
+                            fullscreenApp = windowApplication(quintptr(window));
+                        }
+                        frame.fullscreenApp = fullscreenApp;
                         ++queue.captured;
                         std::lock_guard lock(queue.mutex);
                         if (queue.frames.size() >= 16) {
@@ -413,7 +426,7 @@ void Recorder::run(Settings s, Registry registry) {
                 }
                 if (pixelFormat == AV_PIX_FMT_NONE)
                     throw std::runtime_error("No verified pixel format matches the selected colour mode");
-                writer->open(storage.reserve(), s, w, h, audio.tracks(), pixelFormat);
+                writer->open(storage.reserve(), s, w, h, trackRoles, pixelFormat);
                 storage.identifyActive();
             }
             writer->addVideo(current);
@@ -422,6 +435,15 @@ void Recorder::run(Settings s, Registry registry) {
                 audio.read(epoch + double(totalSamples) / 48000., int(nextSamples - totalSamples)));
             totalSamples = nextSamples;
             ++totalFrames;
+            const auto &app = current.fullscreenApp;
+            if (!app.executable.isEmpty()) {
+                const double end = epoch + double(totalFrames) / s.fps;
+                if (!fullscreen.isEmpty() && fullscreen.last().end == target &&
+                    fullscreen.last().executable == app.executable)
+                    fullscreen.last().end = end;
+                else
+                    fullscreen.append({target, end, app.name, app.executable});
+            }
             {
                 std::lock_guard lock(mutex_);
                 stats_.captured = queue.captured;
@@ -471,6 +493,32 @@ void Recorder::run(Settings s, Registry registry) {
     active_ = false;
     winrt::uninit_apartment();
 }
+static QList<int> clipAudioStreams(const QString &path, const Settings &settings) {
+    if (!settings.clipMic && !settings.clipDesktop)
+        return {};
+    AVFormatContext *input = nullptr;
+    check(avformat_open_input(&input, path.toUtf8().constData(), nullptr, nullptr), "Read replay audio tracks");
+    const auto close = qScopeGuard([&] { avformat_close_input(&input); });
+    QList<int> selected;
+    for (unsigned i = 0; i < input->nb_streams; ++i) {
+        const auto *stream = input->streams[i];
+        if (stream->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
+            continue;
+        const auto *tag = av_dict_get(stream->metadata, "sipping_audio_role", nullptr, 0);
+        const auto role = tag ? QByteArrayView(tag->value) : QByteArrayView();
+        if (settings.clipMic && settings.clipDesktop) {
+            if (!role.startsWith("stem-"))
+                selected << int(i);
+        } else if (role.isEmpty()) {
+            throw std::runtime_error("This replay was buffered without separate audio. Restart recording to "
+                                     "use Mic and Desktop Audio clip controls.");
+        } else if ((settings.clipMic && role.endsWith("-mic")) ||
+                   (settings.clipDesktop && role.endsWith("-desktop")))
+            selected << int(i);
+    }
+    return selected;
+}
+
 QString saveInterval(const Interval &interval, const Settings &s, const QString &output,
                      std::atomic_bool *cancel) {
     if (interval.segments.isEmpty())
@@ -490,6 +538,7 @@ QString saveInterval(const Interval &interval, const Settings &s, const QString 
     file.write(content);
     file.close();
     auto info = inspect(interval.segments.first().path);
+    const auto audioStreams = clipAudioStreams(interval.segments.first().path, s);
     QString encoder = s.encoder;
     if (encoder == "auto")
         throw std::runtime_error("Export requires a resolved encoder snapshot");
@@ -503,9 +552,11 @@ QString saveInterval(const Interval &interval, const Settings &s, const QString 
         "-ss",          QString::number(interval.start - interval.segments.first().start, 'f', 9),
         "-t",           QString::number(interval.duration(), 'f', 9),
         "-map",         "0:v:0",
-        "-map",         "0:a?",
-        "-c:v",         encoder,
-        "-c:a",         s.container == "webm" ? "libopus" : s.container == "mkv" ? "flac" : "aac"};
+        "-c:v",         encoder};
+    for (const int stream : audioStreams)
+        args << "-map" << QString("0:%1").arg(stream);
+    if (!audioStreams.isEmpty())
+        args << "-c:a" << (s.container == "webm" ? "libopus" : s.container == "mkv" ? "flac" : "aac");
     // Exact interval export: source remains immutable; codec implementation was
     // captured with the job. Container validity is checked before submitting jobs.
     QStringList filters;
@@ -528,6 +579,10 @@ QString saveInterval(const Interval &interval, const Settings &s, const QString 
         throw std::runtime_error("Saved original failed complete decoding validation");
     }
     auto saved = inspect(partial);
+    if (saved.audioTracks != audioStreams.size()) {
+        QFile::remove(partial);
+        throw std::runtime_error("Saved clip audio did not match the selected tracks");
+    }
     if (info.hdrMetadata != saved.hdrMetadata) {
         QFile::remove(partial);
         throw std::runtime_error("Saved clip lost available HDR metadata");

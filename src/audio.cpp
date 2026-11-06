@@ -248,6 +248,7 @@ struct Source {
 };
 } // namespace
 struct AudioEngine::Impl {
+    bool splitMix = false;
     std::vector<std::unique_ptr<Source>> sources;
     std::shared_ptr<AudioDeviceEvents> deviceEvents;
     std::thread monitor;
@@ -419,6 +420,7 @@ void AudioEngine::start(const QList<AudioSource> &configs) {
         stop();
         throw std::runtime_error(e.toStdString());
     }
+    impl_->splitMix = trackRoles().value(0) == "mix-all";
 }
 void AudioEngine::stop() {
     for (auto &s : impl_->sources)
@@ -436,14 +438,22 @@ void AudioEngine::stop() {
     impl_->sources.clear();
     impl_->deviceEvents.reset();
 }
-int AudioEngine::tracks() const {
+QStringList AudioEngine::trackRoles() const {
     if (impl_->sources.empty())
-        return 0;
-    int n = 1;
-    for (auto &s : impl_->sources)
-        if (s->config.separate)
-            ++n;
-    return n;
+        return {};
+    QStringList roles{QString()};
+    bool mic = false, desktop = false;
+    for (const auto &source : impl_->sources) {
+        const bool input = source->config.kind == "microphone";
+        if (source->config.mix)
+            (input ? mic : desktop) = true;
+        if (source->config.separate)
+            roles << (input ? "source-mic" : "source-desktop");
+    }
+    roles[0] = mic && desktop ? "mix-all" : mic ? "mix-mic" : desktop ? "mix-desktop" : "mix-empty";
+    if (mic && desktop)
+        roles << "stem-mic" << "stem-desktop";
+    return roles;
 }
 QString AudioEngine::error() const {
     if (impl_->deviceEvents && !impl_->deviceEvents->error().isEmpty())
@@ -469,6 +479,12 @@ QList<std::vector<float>> AudioEngine::read(double start, int frames) {
     if (impl_->sources.empty())
         return out;
     out.append(std::vector<float>(size_t(frames) * 2, 0.f));
+    const bool splitMix = impl_->splitMix;
+    std::vector<float> micMix, desktopMix;
+    if (splitMix) {
+        micMix.resize(size_t(frames) * 2);
+        desktopMix.resize(size_t(frames) * 2);
+    }
     for (auto &s : impl_->sources) {
         std::vector<float> individual(size_t(frames) * 2, 0.f);
         {
@@ -488,11 +504,20 @@ QList<std::vector<float>> AudioEngine::read(double start, int frames) {
                         b.samples[size_t(sourceStart) * 2 + i] * float(s->config.mute ? 0. : s->config.gain);
             }
         }
-        if (s->config.mix)
-            for (size_t i = 0; i < individual.size(); ++i)
+        if (s->config.mix) {
+            auto &stem = s->config.kind == "microphone" ? micMix : desktopMix;
+            for (size_t i = 0; i < individual.size(); ++i) {
                 out[0][i] += individual[i];
+                if (splitMix)
+                    stem[i] += individual[i];
+            }
+        }
         if (s->config.separate)
             out.append(std::move(individual));
+    }
+    if (splitMix) {
+        out.append(std::move(micMix));
+        out.append(std::move(desktopMix));
     }
     for (auto &track : out)
         for (auto &sample : track)

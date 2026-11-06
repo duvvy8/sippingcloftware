@@ -322,7 +322,7 @@ class CompressionTests : public QObject {
         settings.encoder = "libx264";
         settings.fps = 30;
         clip::ExportQueue queue(&buffer, nullptr, tmp_.filePath("queue-jobs"));
-        auto id = queue.submitSave(pin, settings, "Fixture", "", true);
+        auto id = queue.submitSave(pin, settings, true);
         Q_UNUSED(id);
         settings.fps = 15;
         QTRY_VERIFY_WITH_TIMEOUT(!queue.jobs().isEmpty() && queue.jobs().first().terminal, 30000);
@@ -368,7 +368,7 @@ class CompressionTests : public QObject {
         QCOMPARE(job.state, QString("Complete"));
         QVERIFY(job.details["copied"].toBool());
         QVERIFY(!job.details["copyPending"].toBool());
-        QVERIFY(clip::notificationXml(job).contains("Delete unreduced file?"));
+        QVERIFY(clip::notificationXml(job).contains("Delete original?"));
         QCOMPARE(digest(original), before);
     }
     void shortClipboardContentionRetries() {
